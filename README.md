@@ -6,7 +6,7 @@ Searches across multiple platforms with **Reciprocal Rank Fusion (RRF)** to merg
 
 ### Platforms
 
-- **Semantic Scholar** — ML-trained relevance ranking, TLDRs, influential citation counts, bulk Boolean search, paper recommendations
+- **Semantic Scholar** — 200M+ papers across all fields, ML-trained relevance ranking, TLDRs, influential citation counts, bulk Boolean search, paper recommendations
 - **OpenAlex** — 250M+ works, AI-powered semantic search (GTE-Large embeddings), journal/topic/date filtering
 - **CrossRef** — 150M+ records, DOI lookups, field-specific title/author queries, journal ISSN filtering
 - **arXiv** — CS, math, physics preprints
