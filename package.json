@@ -13,11 +13,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.25.2",
     "agents": "^0.3.6",
-    "zod": "^3.24.0",
-    "fast-xml-parser": "^4.5.0"
+    "fast-xml-parser": "^4.5.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250109.0",
+    "@types/node": "^25.4.0",
     "typescript": "^5.7.0",
     "vitest": "^4.0.18",
     "wrangler": "^4.0.0"
