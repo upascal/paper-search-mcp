@@ -21,6 +21,7 @@ export interface SearchResult {
   total_results?: number;
   query: string;
   source: string;
+  warnings?: string[];
 }
 
 /** Search parameters accepted by all platforms. */

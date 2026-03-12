@@ -146,7 +146,7 @@ export async function getRecommendations(
   });
 
   const url = `${RECOMMENDATIONS_URL}/papers?${sp}`;
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

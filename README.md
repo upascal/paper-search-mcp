@@ -19,7 +19,7 @@ Default enabled: `semantic_scholar`, `crossref`, `arxiv`, `openalex`. Configurab
 
 | Tool | Description |
 |------|-------------|
-| `search_papers` | Unified search across all enabled platforms with RRF fusion and deduplication |
+| `search_papers` | Unified search across all enabled platforms with RRF fusion, date filtering, sort control, and citation thresholds |
 | `search_semantic_scholar` | Search Semantic Scholar (supports `bulk=true` for Boolean syntax, up to 1000 results) |
 | `search_openalex` | Search OpenAlex (supports `semantic=true` for embedding-based search) |
 | `search_crossref` | Search CrossRef with title/author/journal filters |
@@ -49,6 +49,10 @@ Default enabled: `semantic_scholar`, `crossref`, `arxiv`, `openalex`. Configurab
 **Paper Recommendations** — `find_similar_papers` uses Semantic Scholar's ML engine. Provide positive seed paper IDs (and optional negative IDs to steer away from) to get ranked recommendations.
 
 **Bulk Boolean Search** — Semantic Scholar bulk search supports `+required`, `-excluded`, `"exact phrase"`, and `|` OR operators. Enable with `bulk=true` for high-recall retrieval up to 1000 results.
+
+**Date Filtering** — `search_papers` supports `date_from` and `date_to` (YYYY-MM-DD) to scope results to a time window. Dates are mapped to platform-native filters where possible, with post-fusion filtering as a safety net.
+
+**Sort & Quality Control** — `sort_by` (relevance/date/citations) controls result ordering. `min_citations` filters low-quality or uncited results (with a warning when preprint sources are heavily filtered).
 
 ## How it works
 
@@ -99,7 +103,7 @@ CONTACT_EMAIL=you@example.com
 Tag a version to trigger the GitHub Actions release workflow:
 
 ```bash
-git tag v0.2.1
+git tag v0.2.2
 git push --tags
 ```
 

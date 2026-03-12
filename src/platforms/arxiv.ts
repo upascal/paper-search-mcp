@@ -56,7 +56,7 @@ export const arxiv: PlatformSource = {
 
   async search(params: SearchParams, _env: Env): Promise<SearchResult> {
     const maxResults = Math.min(params.max_results ?? 10, 50);
-    const sortBy = (params.sort_by as string) ?? "submittedDate";
+    const sortBy = (params.sort_by as string) ?? "relevance";
     const sortOrder = (params.sort_order as string) ?? "descending";
 
     const sp = new URLSearchParams({

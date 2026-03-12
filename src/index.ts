@@ -111,10 +111,10 @@ function getSearchSchema(platform: PlatformSource) {
       break;
     case "arxiv":
       base.sort_by = z
-        .enum(["submittedDate", "relevance", "lastUpdatedDate"])
-        .default("submittedDate")
+        .enum(["relevance", "submittedDate", "lastUpdatedDate"])
+        .default("relevance")
         .optional()
-        .describe("Sort field");
+        .describe("Sort field (default: relevance)");
       base.sort_order = z
         .enum(["ascending", "descending"])
         .default("descending")
@@ -243,7 +243,7 @@ function getSearchDescription(platform: PlatformSource): string {
 export class PaperSearchMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "paper-search",
-    version: "0.2.1",
+    version: "0.2.2",
   });
 
   async init() {
@@ -272,13 +272,16 @@ export class PaperSearchMCP extends McpAgent<Env> {
             CONTACT_EMAIL: "Optional. Used for CrossRef polite pool (better rate limits).",
           },
           tips: [
-            "Use search_papers for best relevance — it searches all platforms and merges results with Reciprocal Rank Fusion (RRF). Set semantic=true for natural language queries.",
-            "Use find_similar_papers to expand a reading list — provide paper IDs you like, get recommendations from Semantic Scholar's ML engine.",
-            "Use search_journal to monitor specific journals (e.g. 'Critical AI', 'Big Data & Society')",
-            "Use search_recent for daily digest workflows — recent articles across platforms with date filtering and RRF ranking",
-            "OpenAlex: set semantic=true for AI-powered semantic search (finds related works even with different vocabulary). Requires OPENALEX_API_KEY.",
-            "Semantic Scholar: set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval. Returns TLDRs for quick scanning.",
-            "CrossRef now defaults to journal-article type and supports title-specific and author-specific queries for less noise",
+            "Use search_papers for best relevance — it searches all platforms and merges results with Reciprocal Rank Fusion (RRF).",
+            "QUERY EXPANSION: For broad topics, decompose into multiple focused search_papers calls covering different facets, synonyms, and related concepts. E.g. instead of 'climate change effects on agriculture', search for 'crop yield climate variability', 'drought resistant farming adaptation', 'food security global warming', etc. Generate sub-queries based on the user's specific research question — don't reuse these examples. This dramatically improves coverage.",
+            "Set semantic=true on search_papers for natural-language or conceptual queries — it runs OpenAlex semantic search alongside keyword search for better recall on thematic queries.",
+            "Use date_from/date_to on search_papers to scope results to a time window (YYYY-MM-DD). Use sort_by='date' to prioritize recent work, or sort_by='citations' for high-impact papers.",
+            "Use min_citations on search_papers to filter out low-quality or uncited results (note: preprints typically have 0 citations).",
+            "Use search_recent for daily digest workflows — it already handles date scoping and multi-platform RRF. Better than manually date-filtering search_papers for 'what's new' queries.",
+            "Use find_similar_papers to expand a reading list — provide paper IDs you like, get ML-powered recommendations. Great after an initial search to discover related work.",
+            "Use search_journal to monitor specific journals (e.g. 'Critical AI', 'Big Data & Society').",
+            "WORKFLOW for thorough literature review: (1) search_papers with semantic=true for the main topic, (2) make additional search_papers calls for sub-topics/synonyms, (3) find_similar_papers on the best results, (4) search_recent to catch new work.",
+            "Semantic Scholar: set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval up to 1000 results.",
           ],
         };
         return {
@@ -367,9 +370,18 @@ export class PaperSearchMCP extends McpAgent<Env> {
       "Search across all enabled academic platforms in parallel, then merge results using Reciprocal Rank Fusion (RRF) " +
         "for a single relevance-ranked list. Papers found by multiple platforms rank higher. " +
         "Set semantic=true to also run OpenAlex semantic search for better natural-language query handling. " +
+        "Supports date_from/date_to filtering, sort_by (relevance/date/citations), and min_citations threshold. " +
+        "IMPORTANT: For broad or multi-faceted topics, make multiple calls with focused queries rather than one vague query. " +
+        "E.g. for 'climate change effects on agriculture', search separately for 'crop yield climate variability', 'drought resistant farming', 'food security warming', etc. " +
         `Currently enabled: ${platforms.map((p) => p.displayName).join(", ")}.`,
       {
-        query: z.string().describe("Search query (natural language or keywords)"),
+        query: z
+          .string()
+          .describe(
+            "Search query — use specific, focused terms for best results. " +
+              "Keyword search is literal-match; for conceptual/thematic queries, set semantic=true. " +
+              "For broad topics, call this tool multiple times with different focused queries."
+          ),
         max_results: z
           .number()
           .min(1)
@@ -394,6 +406,27 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .describe(
             "Also run OpenAlex semantic search alongside keyword search for better relevance on natural language queries"
           ),
+        date_from: z
+          .string()
+          .optional()
+          .describe("Start date (YYYY-MM-DD). Only return papers published on or after this date."),
+        date_to: z
+          .string()
+          .optional()
+          .describe("End date (YYYY-MM-DD). Only return papers published on or before this date."),
+        sort_by: z
+          .enum(["relevance", "date", "citations"])
+          .default("relevance")
+          .optional()
+          .describe("Sort final results by RRF relevance score, publication date, or citation count"),
+        min_citations: z
+          .number()
+          .min(0)
+          .optional()
+          .describe(
+            "Minimum citation count. Papers below this are excluded. " +
+              "Note: preprints (arXiv, bioRxiv) typically have 0 citations."
+          ),
       },
       async (params) => {
         const targetPlatforms = params.platforms
@@ -403,14 +436,40 @@ export class PaperSearchMCP extends McpAgent<Env> {
         const searches: Promise<SearchResult>[] = [];
         const labels: string[] = [];
 
-        // Standard keyword search on all target platforms
+        // Build platform-specific search params with date filtering
         for (const p of targetPlatforms) {
-          searches.push(
-            p.search(
-              { query: params.query, max_results: params.per_platform },
-              this.env
-            )
-          );
+          const searchParams: Record<string, unknown> = {
+            query: params.query,
+            max_results: params.per_platform,
+          };
+
+          // Map date_from/date_to to platform-specific params
+          if (params.date_from || params.date_to) {
+            switch (p.name) {
+              case "semantic_scholar": {
+                // S2 only supports year-level filtering
+                const fromYear = params.date_from?.slice(0, 4);
+                const toYear = params.date_to?.slice(0, 4);
+                if (fromYear && toYear) searchParams.year = `${fromYear}-${toYear}`;
+                else if (fromYear) searchParams.year = `${fromYear}-`;
+                else if (toYear) searchParams.year = `-${toYear}`;
+                break;
+              }
+              case "crossref":
+              case "openalex":
+                if (params.date_from) searchParams.from_date = params.date_from;
+                if (params.date_to) searchParams.to_date = params.date_to;
+                break;
+              // arXiv, PubMed, bioRxiv/medRxiv: post-filter after fusion
+            }
+          }
+
+          // Force arXiv to sort by relevance in unified search
+          if (p.name === "arxiv") {
+            searchParams.sort_by = "relevance";
+          }
+
+          searches.push(p.search(searchParams as any, this.env));
           labels.push(p.name);
         }
 
@@ -418,16 +477,14 @@ export class PaperSearchMCP extends McpAgent<Env> {
         if (params.semantic) {
           const oaPlatform = platforms.find((p) => p.name === "openalex");
           if (oaPlatform) {
-            searches.push(
-              oaPlatform.search(
-                {
-                  query: params.query,
-                  max_results: params.per_platform,
-                  semantic: true,
-                } as any,
-                this.env
-              )
-            );
+            const semanticParams: Record<string, unknown> = {
+              query: params.query,
+              max_results: params.per_platform,
+              semantic: true,
+            };
+            if (params.date_from) semanticParams.from_date = params.date_from;
+            if (params.date_to) semanticParams.to_date = params.date_to;
+            searches.push(oaPlatform.search(semanticParams as any, this.env));
             labels.push("openalex_semantic");
           }
         }
@@ -435,31 +492,83 @@ export class PaperSearchMCP extends McpAgent<Env> {
         const results = await Promise.allSettled(searches);
 
         const rankedLists: Paper[][] = [];
-        const errors: { source: string; error: string }[] = [];
+        const platformResults: { platform: string; status: string; count?: number; error?: string }[] = [];
+        const warnings: string[] = [];
+
         results.forEach((r, i) => {
           if (r.status === "fulfilled") {
             rankedLists.push(r.value.papers);
+            platformResults.push({
+              platform: labels[i],
+              status: "ok",
+              count: r.value.papers.length,
+            });
+            // Surface per-platform warnings
+            if (r.value.warnings) {
+              for (const w of r.value.warnings) warnings.push(`${labels[i]}: ${w}`);
+            }
           } else {
-            errors.push({
-              source: labels[i],
+            platformResults.push({
+              platform: labels[i],
+              status: "error",
               error: r.reason?.message ?? String(r.reason),
             });
+            warnings.push(`${labels[i]} failed: ${r.reason?.message ?? String(r.reason)}`);
           }
         });
 
         // Apply Reciprocal Rank Fusion
-        const fused = reciprocalRankFusion(rankedLists);
+        let fused = reciprocalRankFusion(rankedLists);
+
+        // Post-fusion date filter (safety net for platforms that can't filter server-side)
+        if (params.date_from || params.date_to) {
+          const from = params.date_from ? new Date(params.date_from).getTime() : 0;
+          const to = params.date_to ? new Date(params.date_to + "T23:59:59").getTime() : Infinity;
+          fused = fused.filter((p) => {
+            if (!p.published_date) return true; // keep papers without dates
+            const d = new Date(p.published_date).getTime();
+            return d >= from && d <= to;
+          });
+        }
+
+        // Apply min_citations filter
+        if (params.min_citations !== undefined) {
+          const before = fused.length;
+          fused = fused.filter((p) => p.citations >= params.min_citations!);
+          if (fused.length < before * 0.5) {
+            warnings.push(
+              `min_citations=${params.min_citations} filtered ${before - fused.length} of ${before} results. ` +
+                "Preprint sources (arXiv, bioRxiv) typically have 0 citations."
+            );
+          }
+        }
+
+        // Apply sort
+        if (params.sort_by === "date") {
+          fused.sort(
+            (a, b) =>
+              new Date(b.published_date).getTime() -
+              new Date(a.published_date).getTime()
+          );
+        } else if (params.sort_by === "citations") {
+          fused.sort((a, b) => b.citations - a.citations);
+        }
+        // default "relevance": keep RRF ordering
+
         const finalPapers = fused.slice(0, params.max_results);
 
-        const output = {
+        const output: Record<string, unknown> = {
           query: params.query,
           fusion: "reciprocal_rank_fusion",
-          sources_queried: labels,
+          platform_results: platformResults,
           total_before_fusion: rankedLists.reduce((sum, l) => sum + l.length, 0),
           total_after_fusion: fused.length,
           papers: finalPapers,
-          ...(errors.length > 0 ? { errors } : {}),
         };
+        if (params.date_from || params.date_to) {
+          output.date_filter = { from: params.date_from ?? null, to: params.date_to ?? null };
+        }
+        if (warnings.length > 0) output.warnings = warnings;
 
         return {
           content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
@@ -668,11 +777,17 @@ export class PaperSearchMCP extends McpAgent<Env> {
     // === search_recent — daily digest helper ===
     this.server.tool(
       "search_recent",
-      "Search for recent articles across platforms. Designed for daily digest workflows. " +
-        "Searches OpenAlex, CrossRef, and Semantic Scholar with date filtering, optional journal scoping, " +
-        "and deduplication. Returns results sorted by date.",
+      "Search for recent articles across platforms — preferred over search_papers for 'what's new' queries. " +
+        "Automatically scopes to a time window (default: last 1 day) with date-sorted results. " +
+        "Searches OpenAlex, CrossRef, and Semantic Scholar with RRF fusion, optional journal scoping, " +
+        "and deduplication. Use search_papers with date_from/date_to instead for broader date ranges or when you need more control.",
       {
-        query: z.string().describe("Search terms, e.g. 'social impact of artificial intelligence'"),
+        query: z
+          .string()
+          .describe(
+            "Search terms — use focused keywords for best results. " +
+              "For broad topics, make multiple calls with different sub-queries."
+          ),
         days: z
           .number()
           .min(1)
@@ -821,15 +936,27 @@ export class PaperSearchMCP extends McpAgent<Env> {
         const results = await Promise.allSettled(searches);
 
         const rankedLists: Paper[][] = [];
-        const errors: { source: string; error: string }[] = [];
+        const platformResults: { platform: string; status: string; count?: number; error?: string }[] = [];
+        const warnings: string[] = [];
+
         results.forEach((r, i) => {
           if (r.status === "fulfilled") {
             rankedLists.push(r.value.papers);
+            platformResults.push({
+              platform: searchLabels[i],
+              status: "ok",
+              count: r.value.papers.length,
+            });
+            if (r.value.warnings) {
+              for (const w of r.value.warnings) warnings.push(`${searchLabels[i]}: ${w}`);
+            }
           } else {
-            errors.push({
-              source: searchLabels[i],
+            platformResults.push({
+              platform: searchLabels[i],
+              status: "error",
               error: r.reason?.message ?? String(r.reason),
             });
+            warnings.push(`${searchLabels[i]} failed: ${r.reason?.message ?? String(r.reason)}`);
           }
         });
 
@@ -840,24 +967,23 @@ export class PaperSearchMCP extends McpAgent<Env> {
         if (params.sort === "citations") {
           fused.sort((a, b) => b.citations - a.citations);
         } else if (params.sort === "date") {
-          // For date sort, use date as primary and RRF as tiebreaker
           fused.sort(
             (a, b) =>
               new Date(b.published_date).getTime() -
               new Date(a.published_date).getTime()
           );
         }
-        // default: keep RRF ordering
 
-        const output = {
+        const output: Record<string, unknown> = {
           query: params.query,
           date_range: { from: fromStr, to: toStr },
           journals_filter: params.journals ?? null,
           fusion: "reciprocal_rank_fusion",
+          platform_results: platformResults,
           total: fused.length,
           papers: fused.slice(0, params.max_results),
-          ...(errors.length > 0 ? { errors } : {}),
         };
+        if (warnings.length > 0) output.warnings = warnings;
         return {
           content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
         };
@@ -895,7 +1021,7 @@ export default {
     // Health check
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "paper-search", version: "0.2.1", status: "ok" }),
+        JSON.stringify({ name: "paper-search", version: "0.2.2", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }

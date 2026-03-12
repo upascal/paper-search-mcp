@@ -1,6 +1,6 @@
 {
   "name": "paper-search-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Academic paper search MCP server for Cloudflare Workers (mcp-deploy compatible)",
   "scripts": {
