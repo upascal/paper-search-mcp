@@ -15,6 +15,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getEnabledPlatforms, getAllPlatformNames } from "./registry.js";
 import { resolveSourceId } from "./platforms/openalex.js";
+import { getRecommendations } from "./platforms/semantic-scholar.js";
+import { reciprocalRankFusion } from "./rrf.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,19 @@ function getSearchSchema(platform: PlatformSource) {
         .string()
         .optional()
         .describe("Year filter: '2024', '2020-2024', '2020-', '-2020'");
+      base.bulk = z
+        .boolean()
+        .optional()
+        .describe(
+          "Use bulk search endpoint. Supports Boolean syntax: +required -excluded \"exact phrase\" | OR. " +
+            "Better for high-recall retrieval. Example: +\"artificial intelligence\" +society -\"computer vision\""
+        );
+      base.sort = z
+        .string()
+        .optional()
+        .describe(
+          "Sort (bulk mode only): 'citationCount:desc', 'citationCount:asc', 'publicationDate:desc', 'publicationDate:asc'"
+        );
       break;
     case "crossref":
       base.query_title = z
@@ -149,6 +164,14 @@ function getSearchSchema(platform: PlatformSource) {
         .string()
         .optional()
         .describe("Sort: 'relevance_score:desc', 'cited_by_count:desc', 'publication_date:desc'");
+      base.semantic = z
+        .boolean()
+        .optional()
+        .describe(
+          "Use AI-powered semantic search (GTE-Large embeddings over 217M works). " +
+            "Finds conceptually related works even with different vocabulary. " +
+            "Requires OPENALEX_API_KEY. $0.001/query. Best for natural language queries."
+        );
       break;
   }
 
@@ -195,7 +218,7 @@ function getIdParam(params: Record<string, any>): string {
 function getSearchDescription(platform: PlatformSource): string {
   switch (platform.name) {
     case "semantic_scholar":
-      return "Search academic papers on Semantic Scholar. Great for CS, social science, and interdisciplinary research. Supports year filtering and returns citation counts + open access PDF links.";
+      return "Search academic papers on Semantic Scholar using their ML-trained relevance ranker. Returns TLDRs, influential citation counts, and open access PDF links. Supports year filtering. Set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval up to 1000 results.";
     case "crossref":
       return "Search academic metadata on CrossRef. Covers 150M+ records across all disciplines. Returns DOIs, citation counts, journal info. Supports field-specific title/author queries, date range, journal ISSN, and type filtering. Defaults to journal-article type to reduce noise.";
     case "arxiv":
@@ -207,7 +230,7 @@ function getSearchDescription(platform: PlatformSource): string {
     case "medrxiv":
       return "Browse recent preprints on medRxiv. Note: medRxiv API is date-range based — your query filters results client-side by title/abstract/author text matching.";
     case "openalex":
-      return "Search 250M+ academic works on OpenAlex. Excellent filtering by journal/source, topic, date range, open access, and type. Free API, no key required. Best for structured queries like 'articles in Big Data & Society from last 30 days'.";
+      return "Search 250M+ academic works on OpenAlex. Set semantic=true for AI-powered semantic search (finds conceptually related works even with different vocabulary, requires OPENALEX_API_KEY). Excellent filtering by journal/source, topic, date range, open access, and type.";
     default:
       return `Search papers on ${platform.displayName}.`;
   }
@@ -249,13 +272,13 @@ export class PaperSearchMCP extends McpAgent<Env> {
             CONTACT_EMAIL: "Optional. Used for CrossRef polite pool (better rate limits).",
           },
           tips: [
-            "Use search_papers for broad discovery across all platforms at once",
-            "Use search_journal to find recent articles from a specific journal (e.g. 'Critical AI', 'Big Data & Society')",
-            "Use search_recent for daily digest workflows — searches recent articles across platforms with date filtering",
-            "OpenAlex is best for structured queries — filter by journal, topic, date, open access, and citation count",
-            "Semantic Scholar is best for CS and social science — has citation counts and field-of-study tags",
+            "Use search_papers for best relevance — it searches all platforms and merges results with Reciprocal Rank Fusion (RRF). Set semantic=true for natural language queries.",
+            "Use find_similar_papers to expand a reading list — provide paper IDs you like, get recommendations from Semantic Scholar's ML engine.",
+            "Use search_journal to monitor specific journals (e.g. 'Critical AI', 'Big Data & Society')",
+            "Use search_recent for daily digest workflows — recent articles across platforms with date filtering and RRF ranking",
+            "OpenAlex: set semantic=true for AI-powered semantic search (finds related works even with different vocabulary). Requires OPENALEX_API_KEY.",
+            "Semantic Scholar: set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval. Returns TLDRs for quick scanning.",
             "CrossRef now defaults to journal-article type and supports title-specific and author-specific queries for less noise",
-            "arXiv is best for the latest CS/math/physics preprints",
           ],
         };
         return {
@@ -338,24 +361,38 @@ export class PaperSearchMCP extends McpAgent<Env> {
       }
     }
 
-    // === Unified search_papers ===
+    // === Unified search_papers (with Reciprocal Rank Fusion) ===
     this.server.tool(
       "search_papers",
-      "Search across all enabled academic platforms in parallel. Returns combined results grouped by source. " +
+      "Search across all enabled academic platforms in parallel, then merge results using Reciprocal Rank Fusion (RRF) " +
+        "for a single relevance-ranked list. Papers found by multiple platforms rank higher. " +
+        "Set semantic=true to also run OpenAlex semantic search for better natural-language query handling. " +
         `Currently enabled: ${platforms.map((p) => p.displayName).join(", ")}.`,
       {
-        query: z.string().describe("Search query"),
+        query: z.string().describe("Search query (natural language or keywords)"),
         max_results: z
           .number()
           .min(1)
-          .max(20)
-          .default(5)
-          .describe("Max results per platform"),
+          .max(50)
+          .default(10)
+          .describe("Max total results to return (after fusion)"),
+        per_platform: z
+          .number()
+          .min(1)
+          .max(50)
+          .default(15)
+          .describe("Results to fetch per platform before fusion (more = better fusion quality)"),
         platforms: z
           .array(z.string())
           .optional()
           .describe(
             `Limit to specific platforms. Available: ${platforms.map((p) => p.name).join(", ")}`
+          ),
+        semantic: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also run OpenAlex semantic search alongside keyword search for better relevance on natural language queries"
           ),
       },
       async (params) => {
@@ -363,32 +400,69 @@ export class PaperSearchMCP extends McpAgent<Env> {
           ? platforms.filter((p) => params.platforms!.includes(p.name))
           : platforms;
 
-        const results = await Promise.allSettled(
-          targetPlatforms.map((p) =>
+        const searches: Promise<SearchResult>[] = [];
+        const labels: string[] = [];
+
+        // Standard keyword search on all target platforms
+        for (const p of targetPlatforms) {
+          searches.push(
             p.search(
-              { query: params.query, max_results: params.max_results },
+              { query: params.query, max_results: params.per_platform },
               this.env
             )
-          )
-        );
+          );
+          labels.push(p.name);
+        }
 
-        const combined: { results: any[]; errors: any[] } = {
-          results: [],
-          errors: [],
-        };
+        // If semantic=true, add an OpenAlex semantic search as an additional signal
+        if (params.semantic) {
+          const oaPlatform = platforms.find((p) => p.name === "openalex");
+          if (oaPlatform) {
+            searches.push(
+              oaPlatform.search(
+                {
+                  query: params.query,
+                  max_results: params.per_platform,
+                  semantic: true,
+                } as any,
+                this.env
+              )
+            );
+            labels.push("openalex_semantic");
+          }
+        }
+
+        const results = await Promise.allSettled(searches);
+
+        const rankedLists: Paper[][] = [];
+        const errors: { source: string; error: string }[] = [];
         results.forEach((r, i) => {
           if (r.status === "fulfilled") {
-            combined.results.push(r.value);
+            rankedLists.push(r.value.papers);
           } else {
-            combined.errors.push({
-              source: targetPlatforms[i].name,
+            errors.push({
+              source: labels[i],
               error: r.reason?.message ?? String(r.reason),
             });
           }
         });
 
+        // Apply Reciprocal Rank Fusion
+        const fused = reciprocalRankFusion(rankedLists);
+        const finalPapers = fused.slice(0, params.max_results);
+
+        const output = {
+          query: params.query,
+          fusion: "reciprocal_rank_fusion",
+          sources_queried: labels,
+          total_before_fusion: rankedLists.reduce((sum, l) => sum + l.length, 0),
+          total_after_fusion: fused.length,
+          papers: finalPapers,
+          ...(errors.length > 0 ? { errors } : {}),
+        };
+
         return {
-          content: [{ type: "text", text: JSON.stringify(combined, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
         };
       }
     );
@@ -521,6 +595,73 @@ export class PaperSearchMCP extends McpAgent<Env> {
         return {
           content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
         };
+      }
+    );
+
+    // === find_similar_papers — S2 recommendations ===
+    this.server.tool(
+      "find_similar_papers",
+      "Find papers similar to given seed papers using Semantic Scholar's recommendation engine. " +
+        "Provide 1+ paper IDs you like (positive) and optionally paper IDs you don't want (negative). " +
+        "Accepts Semantic Scholar IDs, DOIs (prefixed DOI:xxx), arXiv IDs (ARXIV:xxx), or PMIDs (PMID:xxx). " +
+        "Great for expanding a reading list or finding related work.",
+      {
+        positive_paper_ids: z
+          .array(z.string())
+          .min(1)
+          .describe(
+            "Paper IDs to find similar papers to. " +
+              "Examples: ['649def34f8be52c8b66281af98ae884c09aef38b', 'DOI:10.1038/s41586-024-07487-w', 'ARXIV:2305.03653']"
+          ),
+        negative_paper_ids: z
+          .array(z.string())
+          .optional()
+          .describe("Paper IDs to steer recommendations away from"),
+        max_results: z
+          .number()
+          .min(1)
+          .max(500)
+          .default(20)
+          .describe("Max recommendations to return (up to 500)"),
+      },
+      async (params) => {
+        try {
+          const papers = await getRecommendations(
+            params.positive_paper_ids,
+            params.negative_paper_ids ?? [],
+            this.env,
+            { limit: params.max_results }
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    seed_papers: params.positive_paper_ids,
+                    negative_papers: params.negative_paper_ids ?? [],
+                    total: papers.length,
+                    papers,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (err: any) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: err.message,
+                  source: "semantic_scholar_recommendations",
+                }),
+              },
+            ],
+          };
+        }
       }
     );
 
@@ -679,11 +820,11 @@ export class PaperSearchMCP extends McpAgent<Env> {
 
         const results = await Promise.allSettled(searches);
 
+        const rankedLists: Paper[][] = [];
         const errors: { source: string; error: string }[] = [];
-        const allPapers: Paper[] = [];
         results.forEach((r, i) => {
           if (r.status === "fulfilled") {
-            allPapers.push(...r.value.papers);
+            rankedLists.push(r.value.papers);
           } else {
             errors.push({
               source: searchLabels[i],
@@ -692,25 +833,29 @@ export class PaperSearchMCP extends McpAgent<Env> {
           }
         });
 
-        const deduplicated = deduplicateByDoi(allPapers);
+        // Use RRF to merge and rank results
+        let fused = reciprocalRankFusion(rankedLists);
 
-        // Sort
+        // Apply secondary sort if requested
         if (params.sort === "citations") {
-          deduplicated.sort((a, b) => b.citations - a.citations);
-        } else {
-          deduplicated.sort(
+          fused.sort((a, b) => b.citations - a.citations);
+        } else if (params.sort === "date") {
+          // For date sort, use date as primary and RRF as tiebreaker
+          fused.sort(
             (a, b) =>
               new Date(b.published_date).getTime() -
               new Date(a.published_date).getTime()
           );
         }
+        // default: keep RRF ordering
 
         const output = {
           query: params.query,
           date_range: { from: fromStr, to: toStr },
           journals_filter: params.journals ?? null,
-          total: deduplicated.length,
-          papers: deduplicated.slice(0, params.max_results),
+          fusion: "reciprocal_rank_fusion",
+          total: fused.length,
+          papers: fused.slice(0, params.max_results),
           ...(errors.length > 0 ? { errors } : {}),
         };
         return {
