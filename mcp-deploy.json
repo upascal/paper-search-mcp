@@ -1,6 +1,6 @@
 {
   "name": "Paper Search",
-  "description": "Search academic papers across multiple platforms (Semantic Scholar, CrossRef, arXiv, PubMed, bioRxiv, medRxiv)",
+  "description": "Search academic papers across multiple platforms (Semantic Scholar, CrossRef, arXiv, OpenAlex, PubMed, bioRxiv, medRxiv)",
   "version": "0.1.0",
   "worker": {
     "name": "paper-search-mcp",
@@ -19,7 +19,7 @@
       "forPlatform": "semantic_scholar",
       "helpText": "API key for Semantic Scholar (optional, but recommended for higher rate limits)",
       "helpUrl": "https://www.semanticscholar.org/product/api",
-      "placeholder": "sk-...",
+      "placeholder": "Enter API key",
       "test": {
         "url": "https://api.semanticscholar.org/graph/v1/paper/search?query=test&limit=1",
         "method": "GET",
@@ -36,12 +36,28 @@
       "forPlatform": "pubmed",
       "helpText": "API key for PubMed (optional, but recommended for higher rate limits)",
       "helpUrl": "https://www.ncbi.nlm.nih.gov/books/NBK25497/",
-      "placeholder": "sk-...",
+      "placeholder": "Enter API key",
       "test": {
         "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=test&retmax=1&api_key={{value}}&retmode=json",
         "method": "GET",
         "success": [200],
         "errors": { "400": "Invalid API key format" }
+      }
+    },
+    {
+      "key": "OPENALEX_API_KEY",
+      "label": "OpenAlex API Key",
+      "type": "password",
+      "required": false,
+      "forPlatform": "openalex",
+      "helpText": "API key for OpenAlex Premium (optional, but recommended for higher rate limits and priority access)",
+      "helpUrl": "https://openalex.org/pricing",
+      "placeholder": "Enter API key",
+      "test": {
+        "url": "https://api.openalex.org/works?search=test&per_page=1&api_key={{value}}",
+        "method": "GET",
+        "success": [200],
+        "errors": { "401": "Invalid API key", "403": "Invalid API key" }
       }
     },
     {
@@ -58,7 +74,7 @@
       "key": "ENABLED_PLATFORMS",
       "label": "Enabled Platforms",
       "type": "multiselect",
-      "default": "semantic_scholar,crossref,arxiv",
+      "default": "semantic_scholar,crossref,arxiv,openalex",
       "helpText": "Select which platforms to enable",
       "options": [
         { "value": "semantic_scholar", "label": "Semantic Scholar" },
@@ -66,7 +82,8 @@
         { "value": "arxiv", "label": "arXiv" },
         { "value": "pubmed", "label": "PubMed" },
         { "value": "biorxiv", "label": "bioRxiv" },
-        { "value": "medrxiv", "label": "medRxiv" }
+        { "value": "medrxiv", "label": "medRxiv" },
+        { "value": "openalex", "label": "OpenAlex" }
       ]
     }
   ],

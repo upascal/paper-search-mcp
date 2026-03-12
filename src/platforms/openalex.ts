@@ -19,6 +19,12 @@ function buildHeaders(env: Env): Record<string, string> {
   return h;
 }
 
+/** Add common query params (mailto, api_key) to a URLSearchParams. */
+function applyAuth(sp: URLSearchParams, env: Env): void {
+  if (env.CONTACT_EMAIL) sp.set("mailto", env.CONTACT_EMAIL);
+  if (env.OPENALEX_API_KEY) sp.set("api_key", env.OPENALEX_API_KEY);
+}
+
 /**
  * OpenAlex stores abstracts as inverted indexes: { "word": [pos1, pos2], ... }
  * This reconstructs the plain-text abstract.
@@ -84,7 +90,7 @@ export async function resolveSourceId(
   env: Env
 ): Promise<{ id: string; issn_l: string | null } | null> {
   const sp = new URLSearchParams({ search: name, per_page: "1" });
-  if (env.CONTACT_EMAIL) sp.set("mailto", env.CONTACT_EMAIL);
+  applyAuth(sp, env);
 
   const url = `${BASE_URL}/sources?${sp}`;
   const resp = await fetchWithRetry(url, { headers: buildHeaders(env) });
@@ -103,7 +109,7 @@ export async function resolveTopicId(
   env: Env
 ): Promise<string | null> {
   const sp = new URLSearchParams({ search: name, per_page: "1" });
-  if (env.CONTACT_EMAIL) sp.set("mailto", env.CONTACT_EMAIL);
+  applyAuth(sp, env);
 
   const url = `${BASE_URL}/topics?${sp}`;
   const resp = await fetchWithRetry(url, { headers: buildHeaders(env) });
@@ -120,7 +126,7 @@ export const openalex: PlatformSource = {
     const perPage = Math.min(params.max_results ?? 10, 100);
 
     const sp = new URLSearchParams({ per_page: String(perPage) });
-    if (env.CONTACT_EMAIL) sp.set("mailto", env.CONTACT_EMAIL);
+    applyAuth(sp, env);
 
     // Search query
     if (params.query) sp.set("search", params.query);
@@ -198,7 +204,7 @@ export const openalex: PlatformSource = {
     const lookupId = isDoi ? `doi:${id}` : id;
 
     const sp = new URLSearchParams();
-    if (env.CONTACT_EMAIL) sp.set("mailto", env.CONTACT_EMAIL);
+    applyAuth(sp, env);
 
     const url = `${BASE_URL}/works/${encodeURIComponent(lookupId)}?${sp}`;
     const resp = await fetchWithRetry(url, { headers: buildHeaders(env) });
