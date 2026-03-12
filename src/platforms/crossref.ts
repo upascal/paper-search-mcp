@@ -66,13 +66,63 @@ export const crossref: PlatformSource = {
 
   async search(params: SearchParams, env: Env): Promise<SearchResult> {
     const rows = Math.min(params.max_results ?? 10, 100);
-    const sp = new URLSearchParams({
-      query: params.query,
-      rows: String(rows),
-    });
+    const sp = new URLSearchParams({ rows: String(rows) });
+
+    // Field-specific queries are far more precise than the generic `query`.
+    // Use query.title / query.author when provided, fall back to generic query.
+    if (params.query_title) {
+      sp.set("query.title", String(params.query_title));
+    }
+    if (params.query_author) {
+      sp.set("query.author", String(params.query_author));
+    }
+    if (!params.query_title && !params.query_author) {
+      // Use query.bibliographic instead of generic query — it searches
+      // title + author + abstract (not publisher/funder/etc.), reducing noise.
+      sp.set("query.bibliographic", params.query);
+    }
+
     if (params.sort) sp.set("sort", String(params.sort));
     if (params.order) sp.set("order", String(params.order));
-    if (params.filter) sp.set("filter", String(params.filter));
+
+    // Build filter parts
+    const filterParts: string[] = [];
+
+    // Preserve raw filter string if provided
+    if (params.filter) {
+      filterParts.push(String(params.filter));
+    }
+
+    // Add convenience date filters
+    if (params.from_date) {
+      filterParts.push(`from-pub-date:${params.from_date}`);
+    }
+    if (params.to_date) {
+      filterParts.push(`until-pub-date:${params.to_date}`);
+    }
+
+    // Add journal ISSN filter
+    if (params.journal_issn) {
+      filterParts.push(`issn:${params.journal_issn}`);
+    }
+
+    // Add type filter (default to journal-article to reduce noise)
+    if (params.type) {
+      filterParts.push(`type:${params.type}`);
+    } else if (!params.filter) {
+      // Default to journal articles when no explicit filter/type is set
+      filterParts.push("type:journal-article");
+    }
+
+    if (filterParts.length > 0) {
+      sp.set("filter", filterParts.join(","));
+    }
+
+    // Only request fields we actually use, for efficiency
+    sp.set(
+      "select",
+      "DOI,title,author,abstract,URL,published,issued,created,is-referenced-by-count,type,subject,publisher,container-title,volume,issue,page,resource,link"
+    );
 
     const email = env.CONTACT_EMAIL ?? "paper-search-mcp@users.noreply.github.com";
     sp.set("mailto", email);

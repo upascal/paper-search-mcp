@@ -3,6 +3,7 @@ import { crossref } from "./platforms/crossref.js";
 import { arxiv } from "./platforms/arxiv.js";
 import { pubmed } from "./platforms/pubmed.js";
 import { biorxiv, medrxiv } from "./platforms/biorxiv.js";
+import { openalex } from "./platforms/openalex.js";
 import type { PlatformSource } from "./platforms/types.js";
 
 const ALL_PLATFORMS: Record<string, PlatformSource> = {
@@ -12,9 +13,10 @@ const ALL_PLATFORMS: Record<string, PlatformSource> = {
   pubmed,
   biorxiv,
   medrxiv,
+  openalex,
 };
 
-const DEFAULT_PLATFORMS = "semantic_scholar,crossref,arxiv";
+const DEFAULT_PLATFORMS = "semantic_scholar,crossref,arxiv,openalex";
 
 export function getEnabledPlatforms(env: Env): PlatformSource[] {
   const list = (env.ENABLED_PLATFORMS ?? DEFAULT_PLATFORMS)
