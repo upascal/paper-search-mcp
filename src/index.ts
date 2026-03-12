@@ -243,7 +243,7 @@ function getSearchDescription(platform: PlatformSource): string {
 export class PaperSearchMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "paper-search",
-    version: "0.2.0",
+    version: "0.2.1",
   });
 
   async init() {
@@ -895,7 +895,7 @@ export default {
     // Health check
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "paper-search", version: "0.2.0", status: "ok" }),
+        JSON.stringify({ name: "paper-search", version: "0.2.1", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }
