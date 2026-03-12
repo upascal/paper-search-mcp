@@ -128,14 +128,18 @@ export const openalex: PlatformSource = {
     const sp = new URLSearchParams({ per_page: String(perPage) });
     applyAuth(sp, env);
 
+    // Always include API key if available (required since Feb 2026)
+    if (env.OPENALEX_API_KEY) sp.set("api_key", env.OPENALEX_API_KEY);
+
     // Search query — use semantic search when requested, otherwise keyword search
-    if (params.semantic === true || params.semantic === "true") {
+    const wantsSemantic = params.semantic === true || params.semantic === "true";
+    if (wantsSemantic && env.OPENALEX_API_KEY) {
       // OpenAlex semantic search uses GTE-Large embeddings over 217M works.
       // Requires API key. $0.001/query. Finds conceptually related works
       // even when they use different terminology.
       if (params.query) sp.set("search.semantic", params.query);
-      if (env.OPENALEX_API_KEY) sp.set("api_key", env.OPENALEX_API_KEY);
     } else {
+      // Fall back to keyword search (also used when no API key is set)
       if (params.query) sp.set("search", params.query);
     }
 
