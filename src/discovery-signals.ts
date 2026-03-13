@@ -1,31 +1,21 @@
 import type { Paper } from "./platforms/types.js";
 
 /**
- * Lifecycle-based discovery signals for ranking research papers.
+ * Age-adaptive quality scoring for research papers.
  *
- * Two scoring modes reflect two research workflows:
+ * Instead of discrete "discovery" vs "literature_review" modes, the weight
+ * profile interpolates continuously based on paper age:
  *
- * 1. **discovery** (0–6 weeks): Surface promising new research before citations
- *    accumulate. Relies on venue quality, multi-platform presence, metadata
- *    completeness, and recency. Author h-index is heavily deweighted (research
- *    shows it's biased against early-career researchers, slower-citing fields
- *    like social science, and women).
+ *   0–6 weeks:   Pre-citation signals (venue quality, multi-platform, metadata)
+ *   6 weeks–1yr: Blend — early citation data emerging + venue/metadata
+ *   1yr+:        Post-citation signals (FWCI, citation percentile, venue)
  *
- * 2. **literature_review** (temporally wide-ranging): Rank established papers
- *    using field-normalized citation metrics (FWCI, citation_normalized_percentile
- *    from OpenAlex) which enable cross-discipline comparison — essential for
- *    work spanning social science, CS, and economics where raw citation counts
- *    differ by an order of magnitude.
- *
- * The key architectural insight from the research: design every scoring function
- * to accept paper age as a parameter that re-weights the signal ensemble.
+ * This means every paper gets scored by the signals actually available at its
+ * lifecycle stage. No mode selection needed — it's fully automatic.
  */
 
-/** Scoring mode. */
-export type ScoringMode = "discovery" | "literature_review";
-
 /** Individual signal values attached to each paper for transparency. */
-export interface DiscoverySignals {
+export interface QualitySignals {
   venue_quality: number;
   fwci: number;
   citation_percentile: number;
@@ -38,114 +28,149 @@ export interface DiscoverySignals {
 }
 
 /**
- * Weight profiles for each scoring mode.
+ * Weight anchors at each end of the lifecycle.
+ * The actual weights are linearly interpolated between these based on paper age.
  *
- * Discovery mode prioritizes signals available for brand-new papers.
- * Literature review mode leans on field-normalized citation metrics.
- *
- * Both sum to 1.0.
+ * "early" = brand new (0 days old), "mature" = 2+ years old.
+ * At 0 days: 100% early weights. At 730 days (2yr): 100% mature weights.
+ * Between: linear blend.
  */
-const WEIGHT_PROFILES: Record<ScoringMode, Record<keyof DiscoverySignals, number>> = {
-  discovery: {
-    venue_quality: 0.25,     // Strongest pre-citation quality signal
-    source_count: 0.20,      // Multi-platform presence = more notable
-    abstract_quality: 0.15,  // Substantive abstract = more complete work
-    metadata_richness: 0.10, // Well-indexed = better provenance
-    recency: 0.10,           // Newer = more timely for discovery
-    author_reputation: 0.08, // Deweighted: biased by field, career stage, gender
-    fwci: 0.05,              // Usually null for new papers, but use if available
-    citation_percentile: 0.02, // Rarely available for new papers
-    author_count: 0.05,      // Minor signal
-  },
-  literature_review: {
-    fwci: 0.30,              // Field-normalized impact — the gold standard
-    venue_quality: 0.20,     // Venue tier matters for established work
-    citation_percentile: 0.15, // Complementary to FWCI
-    source_count: 0.10,      // Multi-platform presence
-    author_reputation: 0.08, // Still deweighted vs. old 30%
-    abstract_quality: 0.05,  // Less important for established papers
-    metadata_richness: 0.05, // Hygiene check
-    recency: 0.05,           // Slight recency preference
-    author_count: 0.02,      // Minor signal
-  },
+const EARLY_WEIGHTS: Record<keyof QualitySignals, number> = {
+  venue_quality: 0.25,
+  source_count: 0.20,
+  abstract_quality: 0.15,
+  metadata_richness: 0.10,
+  recency: 0.10,
+  author_reputation: 0.08,
+  fwci: 0.05,
+  citation_percentile: 0.02,
+  author_count: 0.05,
 };
 
+const MATURE_WEIGHTS: Record<keyof QualitySignals, number> = {
+  fwci: 0.30,
+  venue_quality: 0.20,
+  citation_percentile: 0.15,
+  source_count: 0.10,
+  author_reputation: 0.08,
+  abstract_quality: 0.05,
+  metadata_richness: 0.05,
+  recency: 0.05,
+  author_count: 0.02,
+};
+
+/** Interpolation window in days: 0 = fully early, MATURITY_DAYS = fully mature. */
+const MATURITY_DAYS = 730; // 2 years
+
 /**
- * Compute a 0–100 score for a paper.
+ * Compute interpolated weights based on paper age.
+ */
+function getWeights(daysSincePublication: number): Record<keyof QualitySignals, number> {
+  const t = Math.min(Math.max(daysSincePublication, 0) / MATURITY_DAYS, 1.0);
+
+  const weights = {} as Record<keyof QualitySignals, number>;
+  for (const key of Object.keys(EARLY_WEIGHTS) as (keyof QualitySignals)[]) {
+    weights[key] = EARLY_WEIGHTS[key] * (1 - t) + MATURE_WEIGHTS[key] * t;
+  }
+  return weights;
+}
+
+/**
+ * Compute a 0–100 quality score for a paper.
+ * Weights adapt automatically based on paper age.
  *
  * @param paper - The paper to score
- * @param mode - Scoring mode: "discovery" for new papers (0–6 weeks),
- *               "literature_review" for established papers
  * @param venueQualityData - Optional venue 2yr_mean_citedness from OpenAlex
  *                           batch lookup (keyed by openalex_source_id)
  */
-export function computeDiscoveryScore(
+export function computeQualityScore(
   paper: Paper,
-  mode: ScoringMode = "discovery",
   venueQualityData?: Map<string, { citedness_2yr: number; h_index: number; works_count: number }>
 ): {
   score: number;
-  signals: DiscoverySignals;
-  mode: ScoringMode;
+  signals: QualitySignals;
+  lifecycle_stage: string;
+  paper_age_days: number;
   field_context?: string;
 } {
-  const signals: DiscoverySignals = {
+  const paperAgeDays = getPaperAgeDays(paper);
+
+  const signals: QualitySignals = {
     venue_quality: scoreVenueQuality(paper, venueQualityData),
     fwci: scoreFWCI(paper),
     citation_percentile: scoreCitationPercentile(paper),
     source_count: scoreSourceCount(paper),
     abstract_quality: scoreAbstractQuality(paper),
     metadata_richness: scoreMetadataRichness(paper),
-    recency: scoreRecency(paper, mode),
+    recency: scoreRecency(paper),
     author_reputation: scoreAuthorReputation(paper),
     author_count: scoreAuthorCount(paper),
   };
 
-  const weights = WEIGHT_PROFILES[mode];
+  const weights = getWeights(paperAgeDays);
 
   let score = 0;
   for (const [key, weight] of Object.entries(weights)) {
-    score += signals[key as keyof DiscoverySignals] * weight;
+    score += signals[key as keyof QualitySignals] * weight;
   }
   score = Math.round(score * 100);
 
-  // Include field context if available (helps LLM interpret h-index)
   const fieldContext =
     (paper.extra?.primary_field as string) ??
     (paper.extra?.primary_subfield as string) ??
     undefined;
 
-  return { score, signals, mode, field_context: fieldContext };
+  return {
+    score,
+    signals,
+    lifecycle_stage: getLifecycleStage(paperAgeDays),
+    paper_age_days: paperAgeDays,
+    field_context: fieldContext,
+  };
 }
 
 /**
- * Enrich papers with discovery scores and return sorted by score descending.
+ * Enrich papers with quality scores and return sorted by score descending.
  */
-export function enrichWithDiscoveryScore(
+export function enrichWithQualityScore(
   papers: Paper[],
-  mode: ScoringMode = "discovery",
   venueQualityData?: Map<string, { citedness_2yr: number; h_index: number; works_count: number }>
 ): Paper[] {
   return papers
     .map((paper) => {
-      const { score, signals, mode: scoringMode, field_context } =
-        computeDiscoveryScore(paper, mode, venueQualityData);
+      const { score, signals, lifecycle_stage, paper_age_days, field_context } =
+        computeQualityScore(paper, venueQualityData);
       return {
         ...paper,
         extra: {
           ...paper.extra,
-          discovery_score: score,
-          discovery_signals: signals,
-          scoring_mode: scoringMode,
+          quality_score: score,
+          quality_signals: signals,
+          lifecycle_stage,
+          paper_age_days,
           ...(field_context ? { field_context } : {}),
         },
       };
     })
     .sort(
       (a, b) =>
-        ((b.extra?.discovery_score as number) ?? 0) -
-        ((a.extra?.discovery_score as number) ?? 0)
+        ((b.extra?.quality_score as number) ?? 0) -
+        ((a.extra?.quality_score as number) ?? 0)
     );
+}
+
+
+function getPaperAgeDays(paper: Paper): number {
+  if (!paper.published_date) return 365; // Unknown age: assume ~1 year (mid-range)
+  const pubDate = new Date(paper.published_date).getTime();
+  if (isNaN(pubDate)) return 365;
+  return Math.max(0, (Date.now() - pubDate) / (1000 * 60 * 60 * 24));
+}
+
+function getLifecycleStage(days: number): string {
+  if (days <= 42) return "new";        // 0-6 weeks
+  if (days <= 365) return "emerging";  // 6 weeks - 1 year
+  return "established";                // 1 year+
 }
 
 // ---------------------------------------------------------------------------
@@ -155,145 +180,98 @@ export function enrichWithDiscoveryScore(
 /**
  * Venue quality: uses OpenAlex 2yr_mean_citedness (≈ impact factor) when
  * available from batch lookup, otherwise falls back to venue type heuristic.
- *
- * Citedness normalization: 2yr_mean_citedness of 10+ → 1.0 (top venues like
- * Nature, Science). Most journals fall 1–5. Preprints get 0.4 (partial credit).
  */
 function scoreVenueQuality(
   paper: Paper,
   venueQualityData?: Map<string, { citedness_2yr: number; h_index: number; works_count: number }>
 ): number {
-  // Try enriched venue data first
   const sourceId = paper.extra?.openalex_source_id as string | undefined;
   if (sourceId && venueQualityData?.has(sourceId)) {
     const venue = venueQualityData.get(sourceId)!;
     if (venue.citedness_2yr > 0) {
-      // Normalize: 10+ citedness → 1.0, log scale for better spread
       return Math.min(Math.log10(venue.citedness_2yr + 1) / Math.log10(11), 1.0);
     }
   }
 
-  // Fallback: heuristic based on venue name and type
   const venue =
     (paper.extra?.venue as string) ??
     (paper.extra?.journal as string) ??
     (paper.extra?.container_title as string);
 
   if (!venue) {
-    if (
-      paper.source === "arxiv" ||
-      paper.source === "biorxiv" ||
-      paper.source === "medrxiv"
-    ) {
-      return 0.4; // Preprint servers: partial credit
+    if (paper.source === "arxiv" || paper.source === "biorxiv" || paper.source === "medrxiv") {
+      return 0.4;
     }
     return 0.0;
   }
 
-  const venueType =
-    (paper.extra?.venue_type as string) ??
-    (paper.extra?.type as string);
+  const venueType = (paper.extra?.venue_type as string) ?? (paper.extra?.type as string);
   if (venueType === "journal" || venueType === "conference") return 0.8;
-
-  return 0.6; // Has venue name but unknown type
+  return 0.6;
 }
 
-/**
- * Field-Weighted Citation Impact from OpenAlex.
- * FWCI of 1.0 = average for the field. >1 = above average.
- * Normalized: FWCI of 5+ → 1.0 (excellent). Null → 0.5 (neutral).
- */
+/** FWCI from OpenAlex. 1.0 = field average. Null → 0.5 (neutral). */
 function scoreFWCI(paper: Paper): number {
   const fwci = paper.extra?.fwci as number | null | undefined;
-  if (fwci == null) return 0.5; // Neutral when unavailable
+  if (fwci == null) return 0.5;
   if (fwci <= 0) return 0.0;
-  // Log scale: FWCI 5+ → 1.0
   return Math.min(Math.log10(fwci + 1) / Math.log10(6), 1.0);
 }
 
-/**
- * Citation normalized percentile from OpenAlex.
- * Already a 0–1 value representing percentile rank in same field/year/type.
- * Null → 0.5 (neutral).
- */
+/** Citation percentile from OpenAlex. Already 0–1. Null → 0.5. */
 function scoreCitationPercentile(paper: Paper): number {
   const pct = paper.extra?.citation_normalized_percentile as number | null | undefined;
   if (pct == null) return 0.5;
-  return pct; // Already 0–1
+  return pct;
 }
 
-/**
- * Multi-platform presence: papers found by more platforms are more notable.
- */
+/** Multi-platform presence: found by more platforms = more notable. */
 function scoreSourceCount(paper: Paper): number {
   const count = (paper.extra?.source_count as number) ?? 1;
   return Math.min(count / 4, 1.0);
 }
 
-/**
- * Abstract quality: longer, more substantive abstracts indicate more complete work.
- */
+/** Abstract quality: longer abstracts indicate more complete work. */
 function scoreAbstractQuality(paper: Paper): number {
   const len = paper.abstract?.length ?? 0;
   if (len === 0) return 0.0;
   return Math.min(len / 500, 1.0);
 }
 
-/**
- * Author count: multi-author papers often indicate more resources and review.
- */
+/** Author count: multi-author papers indicate more resources. */
 function scoreAuthorCount(paper: Paper): number {
   const count = paper.authors?.length ?? 0;
   if (count === 0) return 0.0;
   return Math.min(count / 5, 1.0);
 }
 
-/**
- * Metadata richness: papers with categories, keywords, and DOI are better indexed.
- */
+/** Metadata richness: categories, keywords, DOI, field classification. */
 function scoreMetadataRichness(paper: Paper): number {
   let score = 0;
   if (paper.categories && paper.categories.length > 0) score += 0.25;
   if (paper.keywords && paper.keywords.length > 0) score += 0.25;
   if (paper.doi) score += 0.25;
-  // Bonus for having field classification (OpenAlex topic data)
   if (paper.extra?.primary_topic) score += 0.25;
   return score;
 }
 
 /**
- * Recency scoring differs by mode:
- * - Discovery: 0–7 days = 1.0, linear decay to 42 days (6 weeks) = 0.0
- * - Literature review: 0–365 days = 1.0, exponential decay with 3-year half-life
+ * Recency: exponential decay with 1-year half-life.
+ * 0 days = 1.0, 365 days ≈ 0.5, 730 days ≈ 0.25.
  */
-function scoreRecency(paper: Paper, mode: ScoringMode): number {
+function scoreRecency(paper: Paper): number {
   if (!paper.published_date) return 0.5;
   const pubDate = new Date(paper.published_date).getTime();
   if (isNaN(pubDate)) return 0.5;
-
-  const daysSince = (Date.now() - pubDate) / (1000 * 60 * 60 * 24);
-
-  if (mode === "discovery") {
-    if (daysSince <= 7) return 1.0;
-    if (daysSince >= 42) return 0.0;
-    return 1.0 - (daysSince - 7) / 35; // Linear decay 7–42 days
-  }
-
-  // Literature review: exponential decay, 3-year half-life
-  const halfLife = 365 * 3;
+  const daysSince = Math.max(0, (Date.now() - pubDate) / (1000 * 60 * 60 * 24));
+  const halfLife = 365;
   return Math.exp((-Math.LN2 * daysSince) / halfLife);
 }
 
 /**
- * Author reputation: max h-index among authors, heavily deweighted.
- *
- * NOTE: h-index varies dramatically by field and career stage.
- * Full professors average: biology ~30+, CS ~15, law ~2.8, social science ~8-15.
- * It's biased against early-career researchers, women, and slower-citing fields.
- * Use field-normalized metrics (FWCI) for cross-discipline comparison.
- *
- * Normalized: h-index 50+ → 1.0 (reduced from 80 to give more signal range).
- * No data → 0.5 (neutral, doesn't penalize).
+ * Author reputation: max h-index. Heavily deweighted in scoring.
+ * h-index varies by field (CS ~15, biology ~30+, law ~2.8).
+ * No data → 0.5 (neutral).
  */
 function scoreAuthorReputation(paper: Paper): number {
   const hIndices = paper.extra?.author_h_indices as number[] | undefined;
