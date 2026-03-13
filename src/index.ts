@@ -23,6 +23,22 @@ import { getRecommendations } from "./platforms/semantic-scholar.js";
 import { reciprocalRankFusion } from "./rrf.js";
 import { enrichWithQualityScore } from "./discovery-signals.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/server/index.js";
+
+/** Send a status update to the client via MCP logging notification. */
+type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+async function sendStatus(extra: Extra, message: string): Promise<void> {
+  try {
+    await extra.sendNotification({
+      method: "notifications/message",
+      params: { level: "info", logger: "paper-search", data: message },
+    });
+  } catch {
+    // Client may not support logging — fail silently
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Core search helper (shared by search_papers and discover_recent_papers)
@@ -228,10 +244,10 @@ async function dispatchMultiQuery(
 // ---------------------------------------------------------------------------
 
 export class PaperSearchMCP extends McpAgent<Env> {
-  server = new McpServer({
-    name: "paper-search",
-    version: "0.3.0",
-  });
+  server = new McpServer(
+    { name: "paper-search", version: "0.3.0" },
+    { capabilities: { logging: {} } }
+  );
 
   async init() {
     const platforms = getEnabledPlatforms(this.env);
@@ -301,7 +317,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .optional()
           .describe("Minimum citation count. Note: preprints typically have 0 citations."),
       },
-      async (params) => {
+      async (params, extra) => {
         const queries = Array.isArray(params.query) ? params.query : [params.query];
         const warnings: string[] = [];
 
@@ -309,6 +325,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
         let journalIssn: string | undefined;
         let journalSource: string | undefined;
         if (params.journal) {
+          await sendStatus(extra, "Resolving journal...");
           const { issn, sourceId } = await resolveJournal(params.journal, this.env);
           if (!issn && !sourceId) {
             warnings.push(`Could not resolve journal "${params.journal}". Results may not be journal-scoped.`);
@@ -317,6 +334,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           journalSource = sourceId ?? params.journal;
         }
 
+        await sendStatus(extra, `Searching ${queries.length} ${queries.length === 1 ? "query" : "queries"} across ${platforms.length} platforms...`);
         const { allRankedLists, queryResults, warnings: dispatchWarnings } =
           await dispatchMultiQuery(
             queries,
@@ -334,6 +352,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           );
         warnings.push(...dispatchWarnings);
 
+        await sendStatus(extra, "Merging results with rank fusion...");
         // Unified RRF across all queries and platforms
         let fused = reciprocalRankFusion(allRankedLists);
 
@@ -426,7 +445,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .default(20)
           .describe("Max results to return"),
       },
-      async (params) => {
+      async (params, extra) => {
         const queries = Array.isArray(params.query) ? params.query : [params.query];
         const warnings: string[] = [];
 
@@ -453,6 +472,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           }
         }
 
+        await sendStatus(extra, `Searching for papers from the last ${params.days} days...`);
         const { allRankedLists, queryResults, warnings: dispatchWarnings } =
           await dispatchMultiQuery(
             queries,
@@ -469,6 +489,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           );
         warnings.push(...dispatchWarnings);
 
+        await sendStatus(extra, "Merging and scoring results...");
         // RRF across all results
         let fused = reciprocalRankFusion(allRankedLists);
 
@@ -481,6 +502,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           return d >= from && d <= to;
         });
 
+        await sendStatus(extra, "Ranking by quality signals...");
         // Age-adaptive quality scoring — always applied, this IS the purpose
         const sourceIds = fused
           .map((p) => p.extra?.openalex_source_id as string)
@@ -534,7 +556,8 @@ export class PaperSearchMCP extends McpAgent<Env> {
               "Tip: use DOIs from search results for best cross-platform enrichment."
           ),
       },
-      async (params) => {
+      async (params, extra) => {
+        await sendStatus(extra, `Fetching metadata for ${params.paper_ids.length} papers...`);
         const openalexPlatform = platforms.find((p) => p.name === "openalex");
         const s2Platform = platforms.find((p) => p.name === "semantic_scholar");
 
@@ -581,6 +604,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
 
         await Promise.all(fetchPromises);
 
+        await sendStatus(extra, "Enriching venue quality data...");
         // Batch-enrich venue quality
         const sourceIds = paperResults
           .map((p) => p.extra?.openalex_source_id as string)
@@ -589,6 +613,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           ? await batchGetVenueQuality(sourceIds, this.env)
           : undefined;
 
+        await sendStatus(extra, "Computing quality scores...");
         // Score and rank using age-adaptive scoring
         const scored = enrichWithQualityScore(paperResults, venueData);
 
@@ -643,8 +668,9 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .default(20)
           .describe("Max recommendations to return"),
       },
-      async (params) => {
+      async (params, extra) => {
         try {
+          await sendStatus(extra, `Finding papers similar to ${params.positive_paper_ids.length} seed papers...`);
           const papers = await getRecommendations(
             params.positive_paper_ids,
             params.negative_paper_ids ?? [],
@@ -701,9 +727,10 @@ export class PaperSearchMCP extends McpAgent<Env> {
               "'2305.03653' (arXiv), 'W2741809807' (OpenAlex), 'PMID:12345678'"
           ),
       },
-      async (params) => {
+      async (params, extra) => {
         const { targetPlatforms, transformedId } = detectIdType(params.id);
 
+        await sendStatus(extra, `Looking up paper across ${targetPlatforms.length} platforms...`);
         const fetchers: Promise<{ platform: string; paper: Paper | null }>[] = [];
 
         for (const platName of targetPlatforms) {
