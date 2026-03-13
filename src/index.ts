@@ -14,10 +14,11 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getEnabledPlatforms, getAllPlatformNames } from "./registry.js";
-import { resolveSourceId } from "./platforms/openalex.js";
+import { resolveSourceId, batchGetVenueQuality } from "./platforms/openalex.js";
 import { getRecommendations } from "./platforms/semantic-scholar.js";
 import { reciprocalRankFusion } from "./rrf.js";
 import { enrichWithDiscoveryScore } from "./discovery-signals.js";
+import type { ScoringMode } from "./discovery-signals.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 
 // ---------------------------------------------------------------------------
@@ -277,15 +278,17 @@ export class PaperSearchMCP extends McpAgent<Env> {
             "QUERY EXPANSION: For broad topics, decompose into multiple focused search_papers calls covering different facets, synonyms, and related concepts. E.g. instead of 'climate change effects on agriculture', search for 'crop yield climate variability', 'drought resistant farming adaptation', 'food security global warming', etc. Generate sub-queries based on the user's specific research question — don't reuse these examples. This dramatically improves coverage.",
             "Set semantic=true on search_papers for natural-language or conceptual queries — it runs OpenAlex semantic search alongside keyword search for better recall on thematic queries.",
             "Use date_from/date_to on search_papers to scope results to a time window (YYYY-MM-DD). Use sort_by='date' to prioritize recent work, or sort_by='citations' for high-impact papers.",
-            "NEW RESEARCH DISCOVERY: Use sort_by='discovery' on search_papers or sort='discovery' on search_recent to find promising new papers that lack citation data. " +
-              "Scores papers by author h-index, multi-platform presence, venue quality, abstract completeness, and metadata richness. " +
-              "Each paper gets a 0-100 discovery_score with transparent signal breakdowns in the extra field. " +
-              "Best combined with date_from to scope to recent publications.",
+            "TWO SCORING MODES for different research workflows: " +
+              "(1) sort_by='discovery' — for new papers (0-6 weeks). Weights venue impact factor 25%, multi-platform presence 20%, metadata 10%, recency 10%. Author h-index deweighted to 8% (biased by field/gender/career-stage). " +
+              "(2) sort_by='literature_review' — for established papers. Weights FWCI (field-normalized citation impact) 30%, venue quality 20%, citation percentile 15%. Enables cross-discipline comparison (essential for social science + CS + economics). " +
+              "Each paper gets a 0-100 score with transparent signal breakdowns.",
             "Use min_citations on search_papers to filter out low-quality or uncited results (note: preprints typically have 0 citations).",
             "Use search_recent for daily digest workflows — it already handles date scoping and multi-platform RRF. Better than manually date-filtering search_papers for 'what's new' queries.",
             "Use find_similar_papers to expand a reading list — provide paper IDs you like, get ML-powered recommendations. Great after an initial search to discover related work.",
             "Use search_journal to monitor specific journals (e.g. 'Critical AI', 'Big Data & Society').",
-            "WORKFLOW for thorough literature review: (1) search_papers with semantic=true for the main topic, (2) make additional search_papers calls for sub-topics/synonyms, (3) find_similar_papers on the best results, (4) search_recent to catch new work.",
+            "WORKFLOW for thorough literature review: (1) search_papers with semantic=true for the main topic, (2) additional search_papers calls for sub-topics/synonyms, (3) evaluate_papers on the best DOIs with mode='literature_review' for deep quality analysis, (4) find_similar_papers on top results, (5) search_recent to catch new work.",
+            "WORKFLOW for daily discovery: (1) search_recent with sort='discovery' for new papers, (2) evaluate_papers on promising candidates with mode='discovery' for quality scoring, (3) refine with additional search_recent calls if needed.",
+            "evaluate_papers is a standalone quality assessment tool — use it AFTER searching to score/rank candidates from any search. Pass DOIs from search results. Two modes match the two workflows above.",
             "Semantic Scholar: set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval up to 1000 results.",
           ],
         };
@@ -375,9 +378,10 @@ export class PaperSearchMCP extends McpAgent<Env> {
       "Search across all enabled academic platforms in parallel, then merge results using Reciprocal Rank Fusion (RRF) " +
         "for a single relevance-ranked list. Papers found by multiple platforms rank higher. " +
         "Set semantic=true to also run OpenAlex semantic search for better natural-language query handling. " +
-        "Supports date_from/date_to filtering, sort_by (relevance/date/citations/discovery), and min_citations threshold. " +
-        "Use sort_by='discovery' to find promising NEW research that lacks citations — ranks by author h-index, multi-platform presence, venue quality, and metadata completeness. " +
-        "IMPORTANT: For broad or multi-faceted topics, make multiple calls with focused queries rather than one vague query. " +
+        "Supports date_from/date_to filtering, sort_by (relevance/date/citations/discovery/literature_review), and min_citations threshold. " +
+        "Use sort_by='discovery' for NEW research (0-6 weeks) — ranks by venue impact factor, multi-platform presence, metadata quality; h-index deweighted to 8%. " +
+        "Use sort_by='literature_review' for established papers — ranks by FWCI (field-normalized citation impact), citation percentile, venue quality; enables cross-discipline comparison. " +
+        "IMPORTANT: For broad topics, make multiple calls with focused queries. Then use evaluate_papers on the best candidates for deeper quality analysis. " +
         `Currently enabled: ${platforms.map((p) => p.displayName).join(", ")}.`,
       {
         query: z
@@ -420,12 +424,13 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .optional()
           .describe("End date (YYYY-MM-DD). Only return papers published on or before this date."),
         sort_by: z
-          .enum(["relevance", "date", "citations", "discovery"])
+          .enum(["relevance", "date", "citations", "discovery", "literature_review"])
           .default("relevance")
           .optional()
           .describe(
             "Sort by: 'relevance' (RRF score), 'date' (newest first), 'citations' (most cited), " +
-              "or 'discovery' (best for NEW research — scores by author reputation, multi-platform presence, venue quality, and metadata richness instead of citations)"
+              "'discovery' (best for NEW research 0-6 weeks old — ranks by venue quality, multi-platform presence, metadata richness; h-index deweighted), " +
+              "or 'literature_review' (best for established papers — ranks by field-normalized citation impact FWCI, citation percentile, venue quality; enables cross-discipline comparison)"
           ),
         min_citations: z
           .number()
@@ -552,8 +557,16 @@ export class PaperSearchMCP extends McpAgent<Env> {
         }
 
         // Apply sort
-        if (params.sort_by === "discovery") {
-          fused = enrichWithDiscoveryScore(fused);
+        if (params.sort_by === "discovery" || params.sort_by === "literature_review") {
+          const mode: ScoringMode = params.sort_by === "literature_review" ? "literature_review" : "discovery";
+          // Batch-enrich venue quality from OpenAlex
+          const sourceIds = fused
+            .map((p) => p.extra?.openalex_source_id as string)
+            .filter(Boolean);
+          const venueData = sourceIds.length > 0
+            ? await batchGetVenueQuality(sourceIds, this.env)
+            : undefined;
+          fused = enrichWithDiscoveryScore(fused, mode, venueData);
         } else if (params.sort_by === "date") {
           fused.sort(
             (a, b) =>
@@ -784,14 +797,132 @@ export class PaperSearchMCP extends McpAgent<Env> {
       }
     );
 
+    // === evaluate_papers — standalone scoring/evaluation ===
+    this.server.tool(
+      "evaluate_papers",
+      "Evaluate and score a set of papers using field-normalized quality signals. " +
+        "Takes DOIs or paper IDs from previous search results and returns detailed quality assessments. " +
+        "Two modes: 'discovery' (for new papers 0-6 weeks — venue quality, multi-platform presence, metadata) " +
+        "or 'literature_review' (for established papers — FWCI, citation percentile, venue impact factor). " +
+        "Use this AFTER searching to get quality-ranked results, or to compare papers across different searches. " +
+        "WORKFLOW: search_papers → pick candidates → evaluate_papers → refine search → evaluate_papers again. " +
+        "NOTE: h-index is included but deweighted (8%) — it varies dramatically by field " +
+        "(CS full professor ~15, biology ~30+, law ~2.8). Use FWCI for cross-discipline comparison.",
+      {
+        paper_ids: z
+          .array(z.string())
+          .min(1)
+          .max(50)
+          .describe(
+            "DOIs or paper identifiers to evaluate. " +
+              "Accepts DOIs (e.g. '10.1038/s41586-024-07487-w'), " +
+              "Semantic Scholar IDs, or OpenAlex IDs (e.g. 'W2741809807'). " +
+              "Tip: use DOIs from search results for best cross-platform enrichment."
+          ),
+        mode: z
+          .enum(["discovery", "literature_review"])
+          .default("discovery")
+          .describe(
+            "Scoring mode: 'discovery' for new papers (weights venue quality, recency, metadata), " +
+              "'literature_review' for established papers (weights FWCI, citation percentile, venue impact)"
+          ),
+      },
+      async (params) => {
+        const mode: ScoringMode = params.mode as ScoringMode;
+
+        // Fetch papers from OpenAlex and Semantic Scholar in parallel for richest data
+        const openalexPlatform = platforms.find((p) => p.name === "openalex");
+        const s2Platform = platforms.find((p) => p.name === "semantic_scholar");
+
+        const paperResults: Paper[] = [];
+        const errors: string[] = [];
+
+        // Batch fetch from both platforms
+        const fetchPromises: Promise<void>[] = [];
+
+        for (const id of params.paper_ids) {
+          const fetchers: Promise<Paper | null>[] = [];
+
+          if (openalexPlatform?.getById) {
+            fetchers.push(openalexPlatform.getById(id, this.env).catch(() => null));
+          }
+          if (s2Platform?.getById) {
+            // Prefix DOIs for S2
+            const s2Id = id.startsWith("10.") ? `DOI:${id}` : id;
+            fetchers.push(s2Platform.getById(s2Id, this.env).catch(() => null));
+          }
+
+          fetchPromises.push(
+            Promise.all(fetchers).then((results) => {
+              const found = results.filter((r): r is Paper => r !== null);
+              if (found.length === 0) {
+                errors.push(`Not found: ${id}`);
+                return;
+              }
+              // Merge data from both platforms (OpenAlex has FWCI, S2 has h-index)
+              let merged = found[0];
+              if (found.length > 1) {
+                merged = {
+                  ...found[0],
+                  extra: { ...found[1].extra, ...found[0].extra },
+                  // Take better abstract
+                  abstract:
+                    (found[0].abstract?.length ?? 0) >= (found[1].abstract?.length ?? 0)
+                      ? found[0].abstract
+                      : found[1].abstract,
+                  citations: Math.max(found[0].citations, found[1].citations),
+                };
+              }
+              merged.extra = { ...merged.extra, source_count: found.length };
+              paperResults.push(merged);
+            })
+          );
+        }
+
+        await Promise.all(fetchPromises);
+
+        // Batch-enrich venue quality
+        const sourceIds = paperResults
+          .map((p) => p.extra?.openalex_source_id as string)
+          .filter(Boolean);
+        const venueData = sourceIds.length > 0
+          ? await batchGetVenueQuality(sourceIds, this.env)
+          : undefined;
+
+        // Score and rank
+        const scored = enrichWithDiscoveryScore(paperResults, mode, venueData);
+
+        const output: Record<string, unknown> = {
+          mode,
+          mode_description: mode === "discovery"
+            ? "Optimized for new papers (0-6 weeks). Weights: venue quality 25%, multi-platform 20%, abstract 15%, metadata 10%, recency 10%, author 8%, FWCI 5%."
+            : "Optimized for established papers. Weights: FWCI 30%, venue quality 20%, citation percentile 15%, multi-platform 10%, author 8%.",
+          total: scored.length,
+          papers: scored,
+          signal_notes: {
+            fwci: "Field-Weighted Citation Impact from OpenAlex. 1.0 = field average. >1 = above average. Enables cross-discipline comparison.",
+            citation_percentile: "Percentile rank vs. same field/year/type papers. 0.95 = top 5%.",
+            venue_quality: "Based on 2yr_mean_citedness (≈ impact factor) when available, otherwise venue type heuristic.",
+            author_reputation: "Max h-index among authors. CAUTION: varies dramatically by field (CS ~15, biology ~30+, law ~2.8). Deweighted to 8%.",
+          },
+        };
+        if (errors.length > 0) output.errors = errors;
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+        };
+      }
+    );
+
     // === search_recent — daily digest helper ===
     this.server.tool(
       "search_recent",
       "Search for recent articles across platforms — preferred over search_papers for 'what's new' queries. " +
         "Automatically scopes to a time window (default: last 1 day) with date-sorted results. " +
         "Searches OpenAlex, CrossRef, and Semantic Scholar with RRF fusion, optional journal scoping, " +
-        "and deduplication. Set sort='discovery' to rank new papers by author reputation, venue quality, and metadata signals instead of date. " +
-        "Use search_papers with date_from/date_to instead for broader date ranges or when you need more control.",
+        "and deduplication. Set sort='discovery' to rank new papers by venue impact factor, multi-platform presence, and metadata " +
+        "(h-index deweighted to 8% — it's biased across fields). " +
+        "For deeper quality analysis on promising results, follow up with evaluate_papers.",
       {
         query: z
           .string()
@@ -819,11 +950,12 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .default(20)
           .describe("Max total results to return"),
         sort: z
-          .enum(["date", "citations", "discovery"])
+          .enum(["date", "citations", "discovery", "literature_review"])
           .default("date")
           .describe(
             "Sort by: 'date' (newest first), 'citations' (most cited), " +
-              "or 'discovery' (best for finding promising new work — ranks by author reputation, venue quality, multi-platform presence)"
+              "'discovery' (best for new research — ranks by venue quality, multi-platform presence, metadata; h-index deweighted), " +
+              "or 'literature_review' (ranks by field-normalized citation impact, percentile, venue quality)"
           ),
       },
       async (params) => {
@@ -978,8 +1110,15 @@ export class PaperSearchMCP extends McpAgent<Env> {
         let fused = reciprocalRankFusion(rankedLists);
 
         // Apply secondary sort if requested
-        if (params.sort === "discovery") {
-          fused = enrichWithDiscoveryScore(fused);
+        if (params.sort === "discovery" || params.sort === "literature_review") {
+          const mode: ScoringMode = params.sort === "literature_review" ? "literature_review" : "discovery";
+          const sourceIds = fused
+            .map((p) => p.extra?.openalex_source_id as string)
+            .filter(Boolean);
+          const venueData = sourceIds.length > 0
+            ? await batchGetVenueQuality(sourceIds, this.env)
+            : undefined;
+          fused = enrichWithDiscoveryScore(fused, mode, venueData);
         } else if (params.sort === "citations") {
           fused.sort((a, b) => b.citations - a.citations);
         } else if (params.sort === "date") {
