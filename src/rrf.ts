@@ -16,8 +16,8 @@ export function reciprocalRankFusion(
   rankedLists: Paper[][],
   k = 60
 ): Paper[] {
-  // Map: DOI or fallback key -> { paper, score }
-  const scores = new Map<string, { paper: Paper; score: number }>();
+  // Map: DOI or fallback key -> { paper, score, sourceCount }
+  const scores = new Map<string, { paper: Paper; score: number; sourceCount: number }>();
 
   for (const list of rankedLists) {
     for (let rank = 0; rank < list.length; rank++) {
@@ -28,6 +28,7 @@ export function reciprocalRankFusion(
       const existing = scores.get(key);
       if (existing) {
         existing.score += rrfScore;
+        existing.sourceCount += 1;
         // Keep the version with more metadata (longer abstract, more fields)
         if (
           (paper.abstract?.length ?? 0) > (existing.paper.abstract?.length ?? 0)
@@ -35,7 +36,7 @@ export function reciprocalRankFusion(
           existing.paper = mergePaperMetadata(existing.paper, paper);
         }
       } else {
-        scores.set(key, { paper, score: rrfScore });
+        scores.set(key, { paper, score: rrfScore, sourceCount: 1 });
       }
     }
   }
@@ -44,12 +45,13 @@ export function reciprocalRankFusion(
   const results = Array.from(scores.values());
   results.sort((a, b) => b.score - a.score);
 
-  // Attach RRF score in extra metadata
-  return results.map(({ paper, score }) => ({
+  // Attach RRF score and source count in extra metadata
+  return results.map(({ paper, score, sourceCount }) => ({
     ...paper,
     extra: {
       ...paper.extra,
       rrf_score: Math.round(score * 10000) / 10000,
+      source_count: sourceCount,
     },
   }));
 }

@@ -17,6 +17,7 @@ import { getEnabledPlatforms, getAllPlatformNames } from "./registry.js";
 import { resolveSourceId } from "./platforms/openalex.js";
 import { getRecommendations } from "./platforms/semantic-scholar.js";
 import { reciprocalRankFusion } from "./rrf.js";
+import { enrichWithDiscoveryScore } from "./discovery-signals.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 
 // ---------------------------------------------------------------------------
@@ -276,6 +277,10 @@ export class PaperSearchMCP extends McpAgent<Env> {
             "QUERY EXPANSION: For broad topics, decompose into multiple focused search_papers calls covering different facets, synonyms, and related concepts. E.g. instead of 'climate change effects on agriculture', search for 'crop yield climate variability', 'drought resistant farming adaptation', 'food security global warming', etc. Generate sub-queries based on the user's specific research question — don't reuse these examples. This dramatically improves coverage.",
             "Set semantic=true on search_papers for natural-language or conceptual queries — it runs OpenAlex semantic search alongside keyword search for better recall on thematic queries.",
             "Use date_from/date_to on search_papers to scope results to a time window (YYYY-MM-DD). Use sort_by='date' to prioritize recent work, or sort_by='citations' for high-impact papers.",
+            "NEW RESEARCH DISCOVERY: Use sort_by='discovery' on search_papers or sort='discovery' on search_recent to find promising new papers that lack citation data. " +
+              "Scores papers by author h-index, multi-platform presence, venue quality, abstract completeness, and metadata richness. " +
+              "Each paper gets a 0-100 discovery_score with transparent signal breakdowns in the extra field. " +
+              "Best combined with date_from to scope to recent publications.",
             "Use min_citations on search_papers to filter out low-quality or uncited results (note: preprints typically have 0 citations).",
             "Use search_recent for daily digest workflows — it already handles date scoping and multi-platform RRF. Better than manually date-filtering search_papers for 'what's new' queries.",
             "Use find_similar_papers to expand a reading list — provide paper IDs you like, get ML-powered recommendations. Great after an initial search to discover related work.",
@@ -370,9 +375,9 @@ export class PaperSearchMCP extends McpAgent<Env> {
       "Search across all enabled academic platforms in parallel, then merge results using Reciprocal Rank Fusion (RRF) " +
         "for a single relevance-ranked list. Papers found by multiple platforms rank higher. " +
         "Set semantic=true to also run OpenAlex semantic search for better natural-language query handling. " +
-        "Supports date_from/date_to filtering, sort_by (relevance/date/citations), and min_citations threshold. " +
+        "Supports date_from/date_to filtering, sort_by (relevance/date/citations/discovery), and min_citations threshold. " +
+        "Use sort_by='discovery' to find promising NEW research that lacks citations — ranks by author h-index, multi-platform presence, venue quality, and metadata completeness. " +
         "IMPORTANT: For broad or multi-faceted topics, make multiple calls with focused queries rather than one vague query. " +
-        "E.g. for 'climate change effects on agriculture', search separately for 'crop yield climate variability', 'drought resistant farming', 'food security warming', etc. " +
         `Currently enabled: ${platforms.map((p) => p.displayName).join(", ")}.`,
       {
         query: z
@@ -415,10 +420,13 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .optional()
           .describe("End date (YYYY-MM-DD). Only return papers published on or before this date."),
         sort_by: z
-          .enum(["relevance", "date", "citations"])
+          .enum(["relevance", "date", "citations", "discovery"])
           .default("relevance")
           .optional()
-          .describe("Sort final results by RRF relevance score, publication date, or citation count"),
+          .describe(
+            "Sort by: 'relevance' (RRF score), 'date' (newest first), 'citations' (most cited), " +
+              "or 'discovery' (best for NEW research — scores by author reputation, multi-platform presence, venue quality, and metadata richness instead of citations)"
+          ),
         min_citations: z
           .number()
           .min(0)
@@ -544,7 +552,9 @@ export class PaperSearchMCP extends McpAgent<Env> {
         }
 
         // Apply sort
-        if (params.sort_by === "date") {
+        if (params.sort_by === "discovery") {
+          fused = enrichWithDiscoveryScore(fused);
+        } else if (params.sort_by === "date") {
           fused.sort(
             (a, b) =>
               new Date(b.published_date).getTime() -
@@ -780,7 +790,8 @@ export class PaperSearchMCP extends McpAgent<Env> {
       "Search for recent articles across platforms — preferred over search_papers for 'what's new' queries. " +
         "Automatically scopes to a time window (default: last 1 day) with date-sorted results. " +
         "Searches OpenAlex, CrossRef, and Semantic Scholar with RRF fusion, optional journal scoping, " +
-        "and deduplication. Use search_papers with date_from/date_to instead for broader date ranges or when you need more control.",
+        "and deduplication. Set sort='discovery' to rank new papers by author reputation, venue quality, and metadata signals instead of date. " +
+        "Use search_papers with date_from/date_to instead for broader date ranges or when you need more control.",
       {
         query: z
           .string()
@@ -808,9 +819,12 @@ export class PaperSearchMCP extends McpAgent<Env> {
           .default(20)
           .describe("Max total results to return"),
         sort: z
-          .enum(["date", "citations"])
+          .enum(["date", "citations", "discovery"])
           .default("date")
-          .describe("Sort by publication date or citation count"),
+          .describe(
+            "Sort by: 'date' (newest first), 'citations' (most cited), " +
+              "or 'discovery' (best for finding promising new work — ranks by author reputation, venue quality, multi-platform presence)"
+          ),
       },
       async (params) => {
         const now = new Date();
@@ -964,7 +978,9 @@ export class PaperSearchMCP extends McpAgent<Env> {
         let fused = reciprocalRankFusion(rankedLists);
 
         // Apply secondary sort if requested
-        if (params.sort === "citations") {
+        if (params.sort === "discovery") {
+          fused = enrichWithDiscoveryScore(fused);
+        } else if (params.sort === "citations") {
           fused.sort((a, b) => b.citations - a.citations);
         } else if (params.sort === "date") {
           fused.sort(
