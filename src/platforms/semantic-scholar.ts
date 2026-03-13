@@ -4,13 +4,13 @@ import type { PlatformSource, Paper, SearchResult, SearchParams } from "./types.
 const BASE_URL = "https://api.semanticscholar.org/graph/v1";
 const RECOMMENDATIONS_URL = "https://api.semanticscholar.org/recommendations/v1";
 
-// Include tldr and s2FieldsOfStudy for richer results
+// Include tldr, s2FieldsOfStudy, and author-level metrics for discovery signals
 const FIELDS =
-  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr";
+  "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
 
-// Bulk search fields (nested data like citations not available in bulk)
+// Bulk search fields (nested author fields also work in bulk)
 const BULK_FIELDS =
-  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr";
+  "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
 
 function headers(env: Env): Record<string, string> {
   const h: Record<string, string> = {};
@@ -23,6 +23,12 @@ function parsePaper(raw: any): Paper {
   const categories = raw.s2FieldsOfStudy
     ? raw.s2FieldsOfStudy.map((f: any) => f.category ?? "")
     : raw.fieldsOfStudy ?? [];
+
+  // Extract author-level metrics for discovery signals
+  const authorHIndices: number[] = [];
+  for (const a of raw.authors ?? []) {
+    if (a.hIndex != null) authorHIndices.push(a.hIndex);
+  }
 
   return {
     paper_id: raw.paperId ?? "",
@@ -41,6 +47,9 @@ function parsePaper(raw: any): Paper {
       externalIds: raw.externalIds,
       influentialCitationCount: raw.influentialCitationCount,
       tldr: raw.tldr?.text ?? null,
+      author_h_indices: authorHIndices.length > 0 ? authorHIndices : undefined,
+      venue: raw.publicationVenue?.name ?? undefined,
+      venue_type: raw.publicationVenue?.type ?? undefined,
     },
   };
 }

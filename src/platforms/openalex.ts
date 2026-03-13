@@ -77,6 +77,20 @@ function parsePaper(item: any): Paper {
       type: item.type,
       is_open_access: item.open_access?.is_oa,
       openalex_id: item.id,
+      openalex_source_id: item.primary_location?.source?.id,
+      venue_type: item.primary_location?.source?.type,
+      // Field-normalized citation metrics (the good stuff)
+      fwci: item.fwci ?? null,
+      citation_normalized_percentile:
+        item.citation_normalized_percentile?.value ?? null,
+      is_top_1_percent:
+        item.citation_normalized_percentile?.is_in_top_1_percent ?? false,
+      is_top_10_percent:
+        item.citation_normalized_percentile?.is_in_top_10_percent ?? false,
+      // Topic classification for field context
+      primary_topic: item.primary_topic?.display_name ?? null,
+      primary_subfield: item.primary_topic?.subfield?.display_name ?? null,
+      primary_field: item.primary_topic?.field?.display_name ?? null,
     },
   };
 }
@@ -116,6 +130,53 @@ export async function resolveTopicId(
   if (!resp.ok) return null;
   const json = (await resp.json()) as any;
   return json.results?.[0]?.id ?? null;
+}
+
+/**
+ * Batch-lookup venue quality metrics for a set of OpenAlex source IDs.
+ * Returns a map of source_id → { 2yr_mean_citedness, h_index, works_count }.
+ * Uses a single API call with pipe-delimited filter.
+ */
+export async function batchGetVenueQuality(
+  sourceIds: string[],
+  env: Env
+): Promise<Map<string, { citedness_2yr: number; h_index: number; works_count: number }>> {
+  const result = new Map<string, { citedness_2yr: number; h_index: number; works_count: number }>();
+  if (sourceIds.length === 0) return result;
+
+  // Deduplicate and limit to 50 per batch (OpenAlex filter limit)
+  const unique = [...new Set(sourceIds)].slice(0, 50);
+  // Extract short IDs (S12345) from full URLs
+  const shortIds = unique.map((id) => {
+    const match = id.match(/S\d+$/);
+    return match ? match[0] : id;
+  });
+
+  const sp = new URLSearchParams({
+    filter: `ids.openalex:${shortIds.join("|")}`,
+    select: "id,summary_stats,works_count,display_name",
+    per_page: String(shortIds.length),
+  });
+  applyAuth(sp, env);
+
+  try {
+    const url = `${BASE_URL}/sources?${sp}`;
+    const resp = await fetchWithRetry(url, { headers: buildHeaders(env) });
+    if (!resp.ok) return result;
+
+    const json = (await resp.json()) as any;
+    for (const source of json.results ?? []) {
+      result.set(source.id, {
+        citedness_2yr: source.summary_stats?.["2yr_mean_citedness"] ?? 0,
+        h_index: source.summary_stats?.h_index ?? 0,
+        works_count: source.works_count ?? 0,
+      });
+    }
+  } catch {
+    // Non-critical enrichment — fail silently
+  }
+
+  return result;
 }
 
 export const openalex: PlatformSource = {
