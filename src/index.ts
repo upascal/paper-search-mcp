@@ -22,6 +22,113 @@ import type { ScoringMode } from "./discovery-signals.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 
 // ---------------------------------------------------------------------------
+// Core search helper (shared by search_papers and multi_search)
+// ---------------------------------------------------------------------------
+
+interface SearchOptions {
+  query: string;
+  max_results: number;
+  per_platform: number;
+  platforms?: string[];
+  semantic?: boolean;
+  date_from?: string;
+  date_to?: string;
+  sort_by?: string;
+  min_citations?: number;
+}
+
+interface SearchOutput {
+  rankedLists: Paper[][];
+  platformResults: { platform: string; status: string; count?: number; error?: string }[];
+  warnings: string[];
+}
+
+/**
+ * Dispatch a single query to all target platforms and collect ranked lists.
+ * Does NOT apply RRF or sorting — caller handles fusion across queries.
+ */
+async function dispatchSearch(
+  opts: SearchOptions,
+  allPlatforms: PlatformSource[],
+  env: Env
+): Promise<SearchOutput> {
+  const targetPlatforms = opts.platforms
+    ? allPlatforms.filter((p) => opts.platforms!.includes(p.name))
+    : allPlatforms;
+
+  const searches: Promise<SearchResult>[] = [];
+  const labels: string[] = [];
+
+  for (const p of targetPlatforms) {
+    const searchParams: Record<string, unknown> = {
+      query: opts.query,
+      max_results: opts.per_platform,
+    };
+
+    if (opts.date_from || opts.date_to) {
+      switch (p.name) {
+        case "semantic_scholar": {
+          const fromYear = opts.date_from?.slice(0, 4);
+          const toYear = opts.date_to?.slice(0, 4);
+          if (fromYear && toYear) searchParams.year = `${fromYear}-${toYear}`;
+          else if (fromYear) searchParams.year = `${fromYear}-`;
+          else if (toYear) searchParams.year = `-${toYear}`;
+          break;
+        }
+        case "crossref":
+        case "openalex":
+          if (opts.date_from) searchParams.from_date = opts.date_from;
+          if (opts.date_to) searchParams.to_date = opts.date_to;
+          break;
+      }
+    }
+
+    if (p.name === "arxiv") {
+      searchParams.sort_by = "relevance";
+    }
+
+    searches.push(p.search(searchParams as any, env));
+    labels.push(p.name);
+  }
+
+  if (opts.semantic) {
+    const oaPlatform = allPlatforms.find((p) => p.name === "openalex");
+    if (oaPlatform) {
+      const semanticParams: Record<string, unknown> = {
+        query: opts.query,
+        max_results: opts.per_platform,
+        semantic: true,
+      };
+      if (opts.date_from) semanticParams.from_date = opts.date_from;
+      if (opts.date_to) semanticParams.to_date = opts.date_to;
+      searches.push(oaPlatform.search(semanticParams as any, env));
+      labels.push("openalex_semantic");
+    }
+  }
+
+  const results = await Promise.allSettled(searches);
+
+  const rankedLists: Paper[][] = [];
+  const platformResults: { platform: string; status: string; count?: number; error?: string }[] = [];
+  const warnings: string[] = [];
+
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      rankedLists.push(r.value.papers);
+      platformResults.push({ platform: labels[i], status: "ok", count: r.value.papers.length });
+      if (r.value.warnings) {
+        for (const w of r.value.warnings) warnings.push(`${labels[i]}: ${w}`);
+      }
+    } else {
+      platformResults.push({ platform: labels[i], status: "error", error: r.reason?.message ?? String(r.reason) });
+      warnings.push(`${labels[i]} failed: ${r.reason?.message ?? String(r.reason)}`);
+    }
+  });
+
+  return { rankedLists, platformResults, warnings };
+}
+
+// ---------------------------------------------------------------------------
 // Per-platform Zod schemas for tool registration
 // ---------------------------------------------------------------------------
 
@@ -275,7 +382,9 @@ export class PaperSearchMCP extends McpAgent<Env> {
           },
           tips: [
             "Use search_papers for best relevance — it searches all platforms and merges results with Reciprocal Rank Fusion (RRF).",
-            "QUERY EXPANSION: For broad topics, decompose into multiple focused search_papers calls covering different facets, synonyms, and related concepts. E.g. instead of 'climate change effects on agriculture', search for 'crop yield climate variability', 'drought resistant farming adaptation', 'food security global warming', etc. Generate sub-queries based on the user's specific research question — don't reuse these examples. This dramatically improves coverage.",
+            "QUERY EXPANSION: For broad topics, use multi_search with 2-6 focused query variations — it runs ALL queries across ALL platforms in parallel within a single call, much faster than sequential search_papers calls. " +
+              "Generate sub-queries covering different facets, synonyms, and related concepts. E.g. instead of 'climate change effects on agriculture', use " +
+              "['crop yield climate variability', 'drought resistant farming adaptation', 'food security global warming']. Papers appearing across multiple queries rank highest via cross-query RRF.",
             "Set semantic=true on search_papers for natural-language or conceptual queries — it runs OpenAlex semantic search alongside keyword search for better recall on thematic queries.",
             "Use date_from/date_to on search_papers to scope results to a time window (YYYY-MM-DD). Use sort_by='date' to prioritize recent work, or sort_by='citations' for high-impact papers.",
             "TWO SCORING MODES for different research workflows: " +
@@ -286,8 +395,11 @@ export class PaperSearchMCP extends McpAgent<Env> {
             "Use search_recent for daily digest workflows — it already handles date scoping and multi-platform RRF. Better than manually date-filtering search_papers for 'what's new' queries.",
             "Use find_similar_papers to expand a reading list — provide paper IDs you like, get ML-powered recommendations. Great after an initial search to discover related work.",
             "Use search_journal to monitor specific journals (e.g. 'Critical AI', 'Big Data & Society').",
-            "WORKFLOW for thorough literature review: (1) search_papers with semantic=true for the main topic, (2) additional search_papers calls for sub-topics/synonyms, (3) evaluate_papers on the best DOIs with mode='literature_review' for deep quality analysis, (4) find_similar_papers on top results, (5) search_recent to catch new work.",
-            "WORKFLOW for daily discovery: (1) search_recent with sort='discovery' for new papers, (2) evaluate_papers on promising candidates with mode='discovery' for quality scoring, (3) refine with additional search_recent calls if needed.",
+            "WORKFLOW for thorough literature review: (1) multi_search with 3-5 query variations + semantic=true for broad coverage, " +
+              "(2) evaluate_papers on the best DOIs with mode='literature_review' for deep quality analysis, " +
+              "(3) find_similar_papers on top results to expand, (4) search_recent to catch new work.",
+            "WORKFLOW for daily discovery: (1) multi_search with query variations + sort_by='discovery' + date filters for new papers, " +
+              "(2) evaluate_papers on promising candidates with mode='discovery', (3) refine with additional queries if needed.",
             "evaluate_papers is a standalone quality assessment tool — use it AFTER searching to score/rank candidates from any search. Pass DOIs from search results. Two modes match the two workflows above.",
             "Semantic Scholar: set bulk=true for Boolean syntax (+required -excluded \"exact phrase\") and high-recall retrieval up to 1000 results.",
           ],
@@ -381,7 +493,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
         "Supports date_from/date_to filtering, sort_by (relevance/date/citations/discovery/literature_review), and min_citations threshold. " +
         "Use sort_by='discovery' for NEW research (0-6 weeks) — ranks by venue impact factor, multi-platform presence, metadata quality; h-index deweighted to 8%. " +
         "Use sort_by='literature_review' for established papers — ranks by FWCI (field-normalized citation impact), citation percentile, venue quality; enables cross-discipline comparison. " +
-        "IMPORTANT: For broad topics, make multiple calls with focused queries. Then use evaluate_papers on the best candidates for deeper quality analysis. " +
+        "For broad topics, prefer multi_search (parallel multi-query) over multiple search_papers calls — it's faster within the worker timeout. Then use evaluate_papers on the best candidates for deeper quality analysis. " +
         `Currently enabled: ${platforms.map((p) => p.displayName).join(", ")}.`,
       {
         query: z
@@ -442,93 +554,19 @@ export class PaperSearchMCP extends McpAgent<Env> {
           ),
       },
       async (params) => {
-        const targetPlatforms = params.platforms
-          ? platforms.filter((p) => params.platforms!.includes(p.name))
-          : platforms;
-
-        const searches: Promise<SearchResult>[] = [];
-        const labels: string[] = [];
-
-        // Build platform-specific search params with date filtering
-        for (const p of targetPlatforms) {
-          const searchParams: Record<string, unknown> = {
+        const { rankedLists, platformResults, warnings } = await dispatchSearch(
+          {
             query: params.query,
-            max_results: params.per_platform,
-          };
-
-          // Map date_from/date_to to platform-specific params
-          if (params.date_from || params.date_to) {
-            switch (p.name) {
-              case "semantic_scholar": {
-                // S2 only supports year-level filtering
-                const fromYear = params.date_from?.slice(0, 4);
-                const toYear = params.date_to?.slice(0, 4);
-                if (fromYear && toYear) searchParams.year = `${fromYear}-${toYear}`;
-                else if (fromYear) searchParams.year = `${fromYear}-`;
-                else if (toYear) searchParams.year = `-${toYear}`;
-                break;
-              }
-              case "crossref":
-              case "openalex":
-                if (params.date_from) searchParams.from_date = params.date_from;
-                if (params.date_to) searchParams.to_date = params.date_to;
-                break;
-              // arXiv, PubMed, bioRxiv/medRxiv: post-filter after fusion
-            }
-          }
-
-          // Force arXiv to sort by relevance in unified search
-          if (p.name === "arxiv") {
-            searchParams.sort_by = "relevance";
-          }
-
-          searches.push(p.search(searchParams as any, this.env));
-          labels.push(p.name);
-        }
-
-        // If semantic=true, add an OpenAlex semantic search as an additional signal
-        if (params.semantic) {
-          const oaPlatform = platforms.find((p) => p.name === "openalex");
-          if (oaPlatform) {
-            const semanticParams: Record<string, unknown> = {
-              query: params.query,
-              max_results: params.per_platform,
-              semantic: true,
-            };
-            if (params.date_from) semanticParams.from_date = params.date_from;
-            if (params.date_to) semanticParams.to_date = params.date_to;
-            searches.push(oaPlatform.search(semanticParams as any, this.env));
-            labels.push("openalex_semantic");
-          }
-        }
-
-        const results = await Promise.allSettled(searches);
-
-        const rankedLists: Paper[][] = [];
-        const platformResults: { platform: string; status: string; count?: number; error?: string }[] = [];
-        const warnings: string[] = [];
-
-        results.forEach((r, i) => {
-          if (r.status === "fulfilled") {
-            rankedLists.push(r.value.papers);
-            platformResults.push({
-              platform: labels[i],
-              status: "ok",
-              count: r.value.papers.length,
-            });
-            // Surface per-platform warnings
-            if (r.value.warnings) {
-              for (const w of r.value.warnings) warnings.push(`${labels[i]}: ${w}`);
-            }
-          } else {
-            platformResults.push({
-              platform: labels[i],
-              status: "error",
-              error: r.reason?.message ?? String(r.reason),
-            });
-            warnings.push(`${labels[i]} failed: ${r.reason?.message ?? String(r.reason)}`);
-          }
-        });
+            max_results: params.max_results,
+            per_platform: params.per_platform,
+            platforms: params.platforms,
+            semantic: params.semantic,
+            date_from: params.date_from,
+            date_to: params.date_to,
+          },
+          platforms,
+          this.env
+        );
 
         // Apply Reciprocal Rank Fusion
         let fused = reciprocalRankFusion(rankedLists);
@@ -538,7 +576,7 @@ export class PaperSearchMCP extends McpAgent<Env> {
           const from = params.date_from ? new Date(params.date_from).getTime() : 0;
           const to = params.date_to ? new Date(params.date_to + "T23:59:59").getTime() : Infinity;
           fused = fused.filter((p) => {
-            if (!p.published_date) return true; // keep papers without dates
+            if (!p.published_date) return true;
             const d = new Date(p.published_date).getTime();
             return d >= from && d <= to;
           });
@@ -559,7 +597,6 @@ export class PaperSearchMCP extends McpAgent<Env> {
         // Apply sort
         if (params.sort_by === "discovery" || params.sort_by === "literature_review") {
           const mode: ScoringMode = params.sort_by === "literature_review" ? "literature_review" : "discovery";
-          // Batch-enrich venue quality from OpenAlex
           const sourceIds = fused
             .map((p) => p.extra?.openalex_source_id as string)
             .filter(Boolean);
@@ -576,7 +613,6 @@ export class PaperSearchMCP extends McpAgent<Env> {
         } else if (params.sort_by === "citations") {
           fused.sort((a, b) => b.citations - a.citations);
         }
-        // default "relevance": keep RRF ordering
 
         const finalPapers = fused.slice(0, params.max_results);
 
@@ -585,6 +621,174 @@ export class PaperSearchMCP extends McpAgent<Env> {
           fusion: "reciprocal_rank_fusion",
           platform_results: platformResults,
           total_before_fusion: rankedLists.reduce((sum, l) => sum + l.length, 0),
+          total_after_fusion: fused.length,
+          papers: finalPapers,
+        };
+        if (params.date_from || params.date_to) {
+          output.date_filter = { from: params.date_from ?? null, to: params.date_to ?? null };
+        }
+        if (warnings.length > 0) output.warnings = warnings;
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+        };
+      }
+    );
+
+    // === multi_search — parallel multi-query search with unified RRF ===
+    this.server.tool(
+      "multi_search",
+      "Search multiple queries in parallel within a SINGLE worker invocation, then merge ALL results with RRF. " +
+        "Much faster than calling search_papers multiple times — dispatches all queries to all platforms simultaneously " +
+        "instead of sequential round trips. Essential for query expansion workflows. " +
+        "Papers found across multiple queries AND multiple platforms rank highest. " +
+        "USAGE: Pass 2-6 focused query variations covering different facets, synonyms, or sub-topics of the research question. " +
+        "Example: for 'AI governance', use queries like ['algorithmic accountability regulation', " +
+        "'machine learning policy framework', 'AI ethics institutional oversight', 'automated decision-making governance']. " +
+        "Each query hits all enabled platforms in parallel. Results are deduplicated and fused into a single ranked list.",
+      {
+        queries: z
+          .array(z.string())
+          .min(2)
+          .max(6)
+          .describe(
+            "Array of 2-6 focused search queries. Each should cover a different facet, synonym, " +
+              "or sub-topic of the research question. More queries = better recall but slower."
+          ),
+        max_results: z
+          .number()
+          .min(1)
+          .max(100)
+          .default(20)
+          .describe("Max total results to return after fusion across all queries"),
+        per_platform: z
+          .number()
+          .min(1)
+          .max(20)
+          .default(10)
+          .describe("Results per platform per query (keep low to stay within rate limits; 10 is a good default)"),
+        semantic: z
+          .boolean()
+          .optional()
+          .describe("Also run OpenAlex semantic search for each query (adds recall but uses more API budget)"),
+        date_from: z
+          .string()
+          .optional()
+          .describe("Start date (YYYY-MM-DD)"),
+        date_to: z
+          .string()
+          .optional()
+          .describe("End date (YYYY-MM-DD)"),
+        sort_by: z
+          .enum(["relevance", "date", "citations", "discovery", "literature_review"])
+          .default("relevance")
+          .optional()
+          .describe(
+            "Sort by: 'relevance' (RRF — papers appearing across multiple queries rank highest), " +
+              "'discovery' (new research scoring), 'literature_review' (FWCI-based), 'date', or 'citations'"
+          ),
+        min_citations: z
+          .number()
+          .min(0)
+          .optional()
+          .describe("Minimum citation count filter"),
+      },
+      async (params) => {
+        // Dispatch ALL queries in parallel — this is the key performance win.
+        // Each query fans out to all platforms simultaneously.
+        const allDispatches = params.queries.map((query) =>
+          dispatchSearch(
+            {
+              query,
+              max_results: params.max_results,
+              per_platform: params.per_platform,
+              semantic: params.semantic,
+              date_from: params.date_from,
+              date_to: params.date_to,
+            },
+            platforms,
+            this.env
+          )
+        );
+
+        const dispatchResults = await Promise.allSettled(allDispatches);
+
+        // Collect all ranked lists across all queries for unified RRF
+        const allRankedLists: Paper[][] = [];
+        const queryResults: { query: string; status: string; lists: number; papers: number }[] = [];
+        const warnings: string[] = [];
+
+        dispatchResults.forEach((r, i) => {
+          const query = params.queries[i];
+          if (r.status === "fulfilled") {
+            const { rankedLists, platformResults, warnings: qWarnings } = r.value;
+            for (const list of rankedLists) allRankedLists.push(list);
+            queryResults.push({
+              query,
+              status: "ok",
+              lists: rankedLists.length,
+              papers: rankedLists.reduce((sum, l) => sum + l.length, 0),
+            });
+            for (const w of qWarnings) warnings.push(`[${query}] ${w}`);
+          } else {
+            queryResults.push({ query, status: "error", lists: 0, papers: 0 });
+            warnings.push(`[${query}] failed: ${r.reason?.message ?? String(r.reason)}`);
+          }
+        });
+
+        // Unified RRF across ALL queries and ALL platforms
+        // Papers appearing in results for multiple queries get boosted
+        let fused = reciprocalRankFusion(allRankedLists);
+
+        // Post-fusion date filter
+        if (params.date_from || params.date_to) {
+          const from = params.date_from ? new Date(params.date_from).getTime() : 0;
+          const to = params.date_to ? new Date(params.date_to + "T23:59:59").getTime() : Infinity;
+          fused = fused.filter((p) => {
+            if (!p.published_date) return true;
+            const d = new Date(p.published_date).getTime();
+            return d >= from && d <= to;
+          });
+        }
+
+        // Apply min_citations filter
+        if (params.min_citations !== undefined) {
+          const before = fused.length;
+          fused = fused.filter((p) => p.citations >= params.min_citations!);
+          if (fused.length < before * 0.5) {
+            warnings.push(
+              `min_citations=${params.min_citations} filtered ${before - fused.length} of ${before} results.`
+            );
+          }
+        }
+
+        // Apply sort
+        if (params.sort_by === "discovery" || params.sort_by === "literature_review") {
+          const mode: ScoringMode = params.sort_by === "literature_review" ? "literature_review" : "discovery";
+          const sourceIds = fused
+            .map((p) => p.extra?.openalex_source_id as string)
+            .filter(Boolean);
+          const venueData = sourceIds.length > 0
+            ? await batchGetVenueQuality(sourceIds, this.env)
+            : undefined;
+          fused = enrichWithDiscoveryScore(fused, mode, venueData);
+        } else if (params.sort_by === "date") {
+          fused.sort(
+            (a, b) =>
+              new Date(b.published_date).getTime() -
+              new Date(a.published_date).getTime()
+          );
+        } else if (params.sort_by === "citations") {
+          fused.sort((a, b) => b.citations - a.citations);
+        }
+
+        const finalPapers = fused.slice(0, params.max_results);
+
+        const output: Record<string, unknown> = {
+          queries: params.queries,
+          fusion: "reciprocal_rank_fusion_cross_query",
+          query_results: queryResults,
+          total_before_fusion: allRankedLists.reduce((sum, l) => sum + l.length, 0),
           total_after_fusion: fused.length,
           papers: finalPapers,
         };
