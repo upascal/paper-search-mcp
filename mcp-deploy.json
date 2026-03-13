@@ -1,7 +1,7 @@
 {
   "name": "Paper Search",
   "description": "Search academic papers across multiple platforms (Semantic Scholar, CrossRef, arXiv, OpenAlex, PubMed, bioRxiv, medRxiv) with RRF fusion, semantic search, and journal monitoring",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "worker": {
     "name": "paper-search-mcp",
     "durableObjectBinding": "MCP_OBJECT",
