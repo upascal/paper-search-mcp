@@ -72,18 +72,15 @@
   "config": [
     {
       "key": "ENABLED_PLATFORMS",
-      "label": "Enabled Platforms",
+      "label": "Optional Platforms",
       "type": "multiselect",
-      "default": "semantic_scholar,crossref,arxiv,openalex",
-      "helpText": "Select which platforms to enable",
+      "default": "arxiv",
+      "helpText": "Additional domain-specific platforms to enable. Core platforms (Semantic Scholar, CrossRef, OpenAlex) are always on for quality scoring.",
       "options": [
-        { "value": "semantic_scholar", "label": "Semantic Scholar" },
-        { "value": "crossref", "label": "CrossRef" },
         { "value": "arxiv", "label": "arXiv" },
         { "value": "pubmed", "label": "PubMed" },
         { "value": "biorxiv", "label": "bioRxiv" },
-        { "value": "medrxiv", "label": "medRxiv" },
-        { "value": "openalex", "label": "OpenAlex" }
+        { "value": "medrxiv", "label": "medRxiv" }
       ]
     }
   ],
