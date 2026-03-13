@@ -11,7 +11,8 @@ Searches across multiple platforms with unified ranking via Reciprocal Rank Fusi
 - **PubMed** — Biomedical literature via NCBI E-utilities; MeSH terms
 - **bioRxiv / medRxiv** — Biology and medical preprints; category filtering
 
-Default enabled: `semantic_scholar`, `crossref`, `arxiv`, `openalex`. Configurable via `ENABLED_PLATFORMS`.
+**Core platforms** (always on): Semantic Scholar, CrossRef, OpenAlex — provide quality scoring signals (FWCI, h-index, venue quality, citations).
+**Optional platforms** (configurable via `ENABLED_PLATFORMS`): arXiv, PubMed, bioRxiv, medRxiv. Default: `arxiv`.
 
 ## Tools
 
@@ -67,7 +68,7 @@ All platforms return a normalized `Paper` interface with consistent fields (`tit
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ENABLED_PLATFORMS` | No | Comma-separated list (default: `semantic_scholar,crossref,arxiv,openalex`) |
+| `ENABLED_PLATFORMS` | No | Comma-separated list of optional platforms (default: `arxiv`). Core platforms are always on. |
 | `SEMANTIC_SCHOLAR_API_KEY` | No | Higher rate limits; required for recommendations |
 | `OPENALEX_API_KEY` | No* | Enables semantic search ($0.001/query, 100K credits/day free) |
 | `PUBMED_API_KEY` | No | Higher rate limits on E-utilities |
@@ -103,7 +104,7 @@ CONTACT_EMAIL=you@example.com
 Tag a version to trigger the GitHub Actions release workflow:
 
 ```bash
-git tag v0.2.2
+git tag v0.2.3
 git push --tags
 ```
 
