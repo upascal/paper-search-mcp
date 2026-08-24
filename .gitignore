@@ -3,3 +3,7 @@ dist/
 release-assets/
 .dev.vars
 .wrangler/
+
+# Benchmark data and results
+bench/**/.cache/
+bench/**/results/

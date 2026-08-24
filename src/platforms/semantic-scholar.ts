@@ -4,12 +4,12 @@ import type { PlatformSource, Paper, SearchResult, SearchParams } from "./types.
 const BASE_URL = "https://api.semanticscholar.org/graph/v1";
 const RECOMMENDATIONS_URL = "https://api.semanticscholar.org/recommendations/v1";
 
-// Include tldr, s2FieldsOfStudy, and author-level metrics for discovery signals
-const FIELDS =
-  "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
+// Lighter field set for search — reduces payload and rate-limit pressure
+const SEARCH_FIELDS =
+  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,openAccessPdf,publicationVenue";
 
-// Bulk search fields (nested author fields also work in bulk)
-const BULK_FIELDS =
+// Full fields for getById and recommendations — includes enrichment data
+const DETAIL_FIELDS =
   "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
 
 function headers(env: Env): Record<string, string> {
@@ -70,12 +70,17 @@ export const semanticScholar: PlatformSource = {
     const sp = new URLSearchParams({
       query: params.query,
       limit: String(limit),
-      fields: FIELDS,
+      fields: SEARCH_FIELDS,
     });
     if (params.year) sp.set("year", String(params.year));
 
     const url = `${BASE_URL}/paper/search?${sp}`;
-    const resp = await fetchWithRetry(url, { headers: headers(env) });
+    // Unauthenticated S2 has aggressive rate limits (~100 req/5 min);
+    // retry more patiently with higher base delay when no API key is present
+    const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
+    const retries = hasKey ? 3 : 5;
+    const baseDelay = hasKey ? 1000 : 2000;
+    const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
     if (!resp.ok) {
       throw new Error(`Semantic Scholar API ${resp.status}: ${await resp.text()}`);
     }
@@ -91,7 +96,7 @@ export const semanticScholar: PlatformSource = {
   },
 
   async getById(paperId: string, env: Env): Promise<Paper | null> {
-    const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}?fields=${FIELDS}`;
+    const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}?fields=${DETAIL_FIELDS}`;
     const resp = await fetchWithRetry(url, { headers: headers(env) });
     if (resp.status === 404) return null;
     if (!resp.ok) {
@@ -110,7 +115,7 @@ async function bulkSearch(params: SearchParams, env: Env): Promise<SearchResult>
   const limit = Math.min(params.max_results ?? 10, 1000);
   const sp = new URLSearchParams({
     query: params.query,
-    fields: BULK_FIELDS,
+    fields: SEARCH_FIELDS,
   });
   if (params.year) sp.set("year", String(params.year));
   if (params.sort) {
@@ -119,7 +124,10 @@ async function bulkSearch(params: SearchParams, env: Env): Promise<SearchResult>
   }
 
   const url = `${BASE_URL}/paper/search/bulk?${sp}`;
-  const resp = await fetchWithRetry(url, { headers: headers(env) });
+  const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
+  const retries = hasKey ? 3 : 5;
+  const baseDelay = hasKey ? 1000 : 2000;
+  const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
   if (!resp.ok) {
     throw new Error(`Semantic Scholar Bulk API ${resp.status}: ${await resp.text()}`);
   }
@@ -147,7 +155,7 @@ export async function getRecommendations(
   options?: { limit?: number; fields?: string }
 ): Promise<Paper[]> {
   const limit = options?.limit ?? 20;
-  const fields = options?.fields ?? FIELDS;
+  const fields = options?.fields ?? DETAIL_FIELDS;
 
   const sp = new URLSearchParams({
     fields,
@@ -173,4 +181,40 @@ export async function getRecommendations(
 
   const json = (await resp.json()) as any;
   return (json.recommendedPapers ?? []).map(parsePaper);
+}
+
+/**
+ * Citation graph traversal: get papers that cite or are referenced by a given paper.
+ * GET /graph/v1/paper/{id}/citations  — papers that cite this one
+ * GET /graph/v1/paper/{id}/references — papers this one cites
+ */
+export async function getCitations(
+  paperId: string,
+  direction: "citations" | "references",
+  env: Env,
+  options?: { limit?: number }
+): Promise<Paper[]> {
+  const limit = options?.limit ?? 20;
+  const sp = new URLSearchParams({
+    fields: SEARCH_FIELDS,
+    limit: String(limit),
+  });
+
+  const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}/${direction}?${sp}`;
+  const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
+  const retries = hasKey ? 3 : 5;
+  const baseDelay = hasKey ? 1000 : 2000;
+  const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
+
+  if (resp.status === 404) return [];
+  if (!resp.ok) {
+    throw new Error(`S2 ${direction} API ${resp.status}: ${await resp.text()}`);
+  }
+
+  const json = (await resp.json()) as any;
+  const key = direction === "citations" ? "citingPaper" : "citedPaper";
+  return (json.data ?? [])
+    .map((entry: any) => entry[key])
+    .filter((p: any) => p && p.paperId)
+    .map(parsePaper);
 }

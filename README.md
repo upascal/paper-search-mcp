@@ -55,9 +55,22 @@ Searches across multiple platforms with unified ranking via Reciprocal Rank Fusi
 
 **Sort & Quality Control** — `sort_by` (relevance/date/citations) controls result ordering. `min_citations` filters low-quality or uncited results (with a warning when preprint sources are heavily filtered).
 
+## Deploy
+
+Install [mcp-deploy](https://github.com/upascal/mcp-deploy) and deploy to Cloudflare Workers:
+
+```bash
+npm install -g mcp-deploy
+mcp-deploy login
+mcp-deploy add upascal/paper-search-mcp
+mcp-deploy deploy paper-search-mcp
+```
+
+Or use the web UI: `mcp-deploy gui`
+
 ## How it works
 
-This repo contains only MCP logic. Auth, deployment, and UI are handled by mcp-deploy. The repo ships:
+This repo contains only MCP logic. Auth, deployment, and UI are handled by [mcp-deploy](https://github.com/upascal/mcp-deploy) (`npm install -g mcp-deploy`). The repo ships:
 
 - `src/` — MCP server code (Cloudflare Workers + Durable Objects)
 - `mcp-deploy.json` — deployment contract (secrets, config, worker settings)
