@@ -89,11 +89,20 @@ export function computeQualityScore(
 ): {
   score: number;
   signals: QualitySignals;
+  defaulted_signals: string[];
   lifecycle_stage: string;
   paper_age_days: number;
   field_context?: string;
 } {
   const paperAgeDays = getPaperAgeDays(paper);
+
+  // Signals that fall back to a neutral 0.5 when the source metric is absent
+  // (e.g. the paper is not indexed by OpenAlex yet). Surfaced in the output so
+  // synthesized mid-range values aren't mistaken for measured quality.
+  const defaultedSignals: string[] = [];
+  if (paper.extra?.fwci == null) defaultedSignals.push("fwci");
+  if (paper.extra?.citation_normalized_percentile == null)
+    defaultedSignals.push("citation_percentile");
 
   const signals: QualitySignals = {
     venue_quality: scoreVenueQuality(paper, venueQualityData),
@@ -123,6 +132,7 @@ export function computeQualityScore(
   return {
     score,
     signals,
+    defaulted_signals: defaultedSignals,
     lifecycle_stage: getLifecycleStage(paperAgeDays),
     paper_age_days: paperAgeDays,
     field_context: fieldContext,
@@ -138,7 +148,7 @@ export function enrichWithQualityScore(
 ): Paper[] {
   return papers
     .map((paper) => {
-      const { score, signals, lifecycle_stage, paper_age_days, field_context } =
+      const { score, signals, defaulted_signals, lifecycle_stage, paper_age_days, field_context } =
         computeQualityScore(paper, venueQualityData);
       return {
         ...paper,
@@ -146,6 +156,7 @@ export function enrichWithQualityScore(
           ...paper.extra,
           quality_score: score,
           quality_signals: signals,
+          ...(defaulted_signals.length > 0 ? { quality_signals_defaulted: defaulted_signals } : {}),
           lifecycle_stage,
           paper_age_days,
           ...(field_context ? { field_context } : {}),

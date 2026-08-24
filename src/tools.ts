@@ -500,7 +500,8 @@ export function registerTools(server: McpServer, env: Env): void {
         date_range: { from: dateFrom, to: dateTo },
         scoring: "age_adaptive_quality",
         query_results: queryResults,
-        total: fused.length,
+        total_candidates: fused.length,
+        returned: finalPapers.length,
         papers: finalPapers,
       };
       if (params.journals) {

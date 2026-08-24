@@ -8,9 +8,14 @@ const RECOMMENDATIONS_URL = "https://api.semanticscholar.org/recommendations/v1"
 const SEARCH_FIELDS =
   "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,openAccessPdf,publicationVenue";
 
-// Full fields for getById and recommendations — includes enrichment data
+// Full fields for getById — includes enrichment data
 const DETAIL_FIELDS =
   "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
+
+// The /recommendations endpoint accepts a narrower field set than /graph:
+// tldr and the authors.* aggregate metrics are rejected with a 400.
+const RECOMMENDATION_FIELDS =
+  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,publicationVenue";
 
 function headers(env: Env): Record<string, string> {
   const h: Record<string, string> = {};
@@ -155,7 +160,7 @@ export async function getRecommendations(
   options?: { limit?: number; fields?: string }
 ): Promise<Paper[]> {
   const limit = options?.limit ?? 20;
-  const fields = options?.fields ?? DETAIL_FIELDS;
+  const fields = options?.fields ?? RECOMMENDATION_FIELDS;
 
   const sp = new URLSearchParams({
     fields,
