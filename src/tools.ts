@@ -15,7 +15,7 @@ import { reciprocalRankFusion } from "./rrf.js";
 import { enrichWithQualityScore } from "./discovery-signals.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/server/index.js";
+import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,10 +25,15 @@ type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 async function sendStatus(extra: Extra, message: string): Promise<void> {
   try {
-    await extra.sendNotification({
-      method: "notifications/message",
-      params: { level: "info", logger: "paper-search", data: message },
-    });
+    // Race against a short timeout: status updates are best-effort, and a
+    // dead/unwritable stream must never stall the tool call itself.
+    await Promise.race([
+      extra.sendNotification({
+        method: "notifications/message",
+        params: { level: "info", logger: "paper-search", data: message },
+      }),
+      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+    ]);
   } catch {
     // Client may not support logging — fail silently
   }
