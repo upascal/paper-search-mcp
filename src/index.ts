@@ -250,7 +250,7 @@ async function dispatchMultiQuery(
 
 export class PaperSearchMCP extends McpAgent<Env> {
   server = new McpServer(
-    { name: "paper-search", version: "0.2.4" },
+    { name: "paper-search", version: "0.2.5" },
     { capabilities: { logging: {} } }
   );
 
@@ -818,7 +818,7 @@ export default {
 
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "paper-search", version: "0.2.4", status: "ok" }),
+        JSON.stringify({ name: "paper-search", version: "0.2.5", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }
