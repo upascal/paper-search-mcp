@@ -1,6 +1,6 @@
 {
   "name": "paper-search-mcp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "Academic paper search MCP server for Cloudflare Workers (mcp-deploy compatible)",
   "scripts": {
@@ -11,10 +11,10 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.25.2",
-    "agents": "^0.3.6",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "agents": "^0.21.0",
     "fast-xml-parser": "^4.5.0",
-    "zod": "^3.24.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250109.0",
