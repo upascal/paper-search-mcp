@@ -595,45 +595,43 @@ export function registerTools(server: McpServer, env: Env): void {
       const paperResults: Paper[] = [];
       const unresolvedIds: { id: string; error: string }[] = [];
 
-      const fetchPromises: Promise<void>[] = [];
+      // One batched request per platform instead of a GET per paper — 50 IDs
+      // is one S2 /paper/batch POST plus one OpenAlex filter call, which is
+      // the difference between working and cascading 429s without an S2 key.
+      const ids = params.paper_ids;
+      const s2Ids = ids.map((id) => (id.startsWith("10.") ? `DOI:${id}` : id));
+      const emptyBatch = () => new Array<Paper | null>(ids.length).fill(null);
 
-      for (const id of params.paper_ids) {
-        const fetchers: Promise<Paper | null>[] = [];
+      const [oaResults, s2Results] = await Promise.all([
+        openalexPlatform?.getByIdBatch
+          ? openalexPlatform.getByIdBatch(ids, env).catch(emptyBatch)
+          : Promise.resolve(emptyBatch()),
+        s2Platform?.getByIdBatch
+          ? s2Platform.getByIdBatch(s2Ids, env).catch(emptyBatch)
+          : Promise.resolve(emptyBatch()),
+      ]);
 
-        if (openalexPlatform?.getById) {
-          fetchers.push(openalexPlatform.getById(id, env).catch(() => null));
+      for (let i = 0; i < ids.length; i++) {
+        const found = [oaResults[i], s2Results[i]].filter((r): r is Paper => r != null);
+        if (found.length === 0) {
+          unresolvedIds.push({ id: ids[i], error: "Could not resolve — try providing a DOI" });
+          continue;
         }
-        if (s2Platform?.getById) {
-          const s2Id = id.startsWith("10.") ? `DOI:${id}` : id;
-          fetchers.push(s2Platform.getById(s2Id, env).catch(() => null));
+        let merged = found[0];
+        if (found.length > 1) {
+          merged = {
+            ...found[0],
+            extra: { ...found[1].extra, ...found[0].extra },
+            abstract:
+              (found[0].abstract?.length ?? 0) >= (found[1].abstract?.length ?? 0)
+                ? found[0].abstract
+                : found[1].abstract,
+            citations: Math.max(found[0].citations, found[1].citations),
+          };
         }
-
-        fetchPromises.push(
-          Promise.all(fetchers).then((results) => {
-            const found = results.filter((r): r is Paper => r !== null);
-            if (found.length === 0) {
-              unresolvedIds.push({ id, error: "Could not resolve — try providing a DOI" });
-              return;
-            }
-            let merged = found[0];
-            if (found.length > 1) {
-              merged = {
-                ...found[0],
-                extra: { ...found[1].extra, ...found[0].extra },
-                abstract:
-                  (found[0].abstract?.length ?? 0) >= (found[1].abstract?.length ?? 0)
-                    ? found[0].abstract
-                    : found[1].abstract,
-                citations: Math.max(found[0].citations, found[1].citations),
-              };
-            }
-            merged.extra = { ...merged.extra, source_count: found.length };
-            paperResults.push(merged);
-          })
-        );
+        merged.extra = { ...merged.extra, source_count: found.length };
+        paperResults.push(merged);
       }
-
-      await Promise.all(fetchPromises);
 
       await sendStatus(extra, "Enriching venue quality data...");
       // Batch-enrich venue quality

@@ -37,4 +37,6 @@ export interface PlatformSource {
   displayName: string;
   search(params: SearchParams, env: Env): Promise<SearchResult>;
   getById?(id: string, env: Env): Promise<Paper | null>;
+  /** Batch lookup; returns an array aligned with the input, null per unresolved ID. */
+  getByIdBatch?(ids: string[], env: Env): Promise<(Paper | null)[]>;
 }

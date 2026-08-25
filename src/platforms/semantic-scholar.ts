@@ -80,12 +80,7 @@ export const semanticScholar: PlatformSource = {
     if (params.year) sp.set("year", String(params.year));
 
     const url = `${BASE_URL}/paper/search?${sp}`;
-    // Unauthenticated S2 has aggressive rate limits (~100 req/5 min);
-    // retry more patiently with higher base delay when no API key is present
-    const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
-    const retries = hasKey ? 3 : 5;
-    const baseDelay = hasKey ? 1000 : 2000;
-    const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
+    const resp = await fetchWithRetry(url, { headers: headers(env) });
     if (!resp.ok) {
       throw new Error(`Semantic Scholar API ${resp.status}: ${await resp.text()}`);
     }
@@ -109,6 +104,31 @@ export const semanticScholar: PlatformSource = {
     }
     return parsePaper(await resp.json());
   },
+
+  /**
+   * Batch lookup: POST /paper/batch resolves up to 500 IDs per request —
+   * one call instead of a GET per paper, which is the difference between
+   * working and cascading 429s without an API key.
+   * Unknown or foreign IDs (e.g. OpenAlex W-ids) come back as null, not 400.
+   * Returns an array aligned with the input.
+   */
+  async getByIdBatch(paperIds: string[], env: Env): Promise<(Paper | null)[]> {
+    const out: (Paper | null)[] = [];
+    for (let i = 0; i < paperIds.length; i += 500) {
+      const chunk = paperIds.slice(i, i + 500);
+      const resp = await fetchWithRetry(`${BASE_URL}/paper/batch?fields=${DETAIL_FIELDS}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers(env) },
+        body: JSON.stringify({ ids: chunk }),
+      });
+      if (!resp.ok) {
+        throw new Error(`Semantic Scholar Batch API ${resp.status}: ${await resp.text()}`);
+      }
+      const json = (await resp.json()) as any[];
+      out.push(...json.map((raw) => (raw && raw.paperId ? parsePaper(raw) : null)));
+    }
+    return out;
+  },
 };
 
 /**
@@ -129,10 +149,7 @@ async function bulkSearch(params: SearchParams, env: Env): Promise<SearchResult>
   }
 
   const url = `${BASE_URL}/paper/search/bulk?${sp}`;
-  const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
-  const retries = hasKey ? 3 : 5;
-  const baseDelay = hasKey ? 1000 : 2000;
-  const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
+  const resp = await fetchWithRetry(url, { headers: headers(env) });
   if (!resp.ok) {
     throw new Error(`Semantic Scholar Bulk API ${resp.status}: ${await resp.text()}`);
   }
@@ -206,10 +223,7 @@ export async function getCitations(
   });
 
   const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}/${direction}?${sp}`;
-  const hasKey = !!env.SEMANTIC_SCHOLAR_API_KEY;
-  const retries = hasKey ? 3 : 5;
-  const baseDelay = hasKey ? 1000 : 2000;
-  const resp = await fetchWithRetry(url, { headers: headers(env) }, retries, baseDelay);
+  const resp = await fetchWithRetry(url, { headers: headers(env) });
 
   if (resp.status === 404) return [];
   if (!resp.ok) {

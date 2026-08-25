@@ -34,6 +34,16 @@ function sanitizeQuery(query: string): string {
   return query.replace(/[*?]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function normalizeDoi(id: string): string {
+  return id.replace(/^https?:\/\/doi\.org\//i, "").toLowerCase();
+}
+
+/** Extract the short work ID (W12345) from a bare or URL-form OpenAlex ID. */
+function shortWorkId(id: string): string {
+  const m = id.match(/W\d+$/i);
+  return m ? m[0].toUpperCase() : id.toUpperCase();
+}
+
 /**
  * OpenAlex stores abstracts as inverted indexes: { "word": [pos1, pos2], ... }
  * This reconstructs the plain-text abstract.
@@ -295,5 +305,62 @@ export const openalex: PlatformSource = {
       throw new Error(`OpenAlex API ${resp.status}: ${await resp.text()}`);
     }
     return parsePaper(await resp.json());
+  },
+
+  /**
+   * Batch lookup by DOI or OpenAlex work ID: one pipe-delimited filter call
+   * per 50 IDs (OpenAlex OR-filter limit) instead of a request per paper.
+   * IDs OpenAlex cannot resolve (e.g. raw S2 hashes) come back as null.
+   * Returns an array aligned with the input.
+   */
+  async getByIdBatch(ids: string[], env: Env): Promise<(Paper | null)[]> {
+    const out: (Paper | null)[] = new Array(ids.length).fill(null);
+
+    // Group input indices by lookup type; anything else stays null
+    const doiIdx: number[] = [];
+    const workIdx: number[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      if (/^(https?:\/\/doi\.org\/)?10\./i.test(ids[i])) doiIdx.push(i);
+      else if (/^(https?:\/\/openalex\.org\/)?W\d+$/i.test(ids[i])) workIdx.push(i);
+    }
+
+    const runChunks = async (
+      indices: number[],
+      filterKey: string,
+      keyOfInput: (id: string) => string,
+      keyOfItem: (item: any) => string
+    ): Promise<void> => {
+      for (let c = 0; c < indices.length; c += 50) {
+        const chunk = indices.slice(c, c + 50);
+        const keys = chunk.map((i) => keyOfInput(ids[i]));
+        const sp = new URLSearchParams({
+          filter: `${filterKey}:${keys.join("|")}`,
+          per_page: String(chunk.length),
+        });
+        applyAuth(sp, env);
+        try {
+          const resp = await fetchWithRetry(`${BASE_URL}/works?${sp}`, {
+            headers: buildHeaders(env),
+          });
+          if (!resp.ok) continue;
+          const json = (await resp.json()) as any;
+          const byKey = new Map<string, any>();
+          for (const item of json.results ?? []) {
+            byKey.set(keyOfItem(item), item);
+          }
+          for (const i of chunk) {
+            const item = byKey.get(keyOfInput(ids[i]));
+            if (item) out[i] = parsePaper(item);
+          }
+        } catch {
+          // Leave nulls — rerank falls back to the other platform's record
+        }
+      }
+    };
+
+    await runChunks(doiIdx, "doi", normalizeDoi, (item) => normalizeDoi(item.doi ?? ""));
+    await runChunks(workIdx, "ids.openalex", shortWorkId, (item) => shortWorkId(item.id ?? ""));
+
+    return out;
   },
 };

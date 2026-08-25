@@ -1,13 +1,20 @@
 /**
  * Per-domain rate limiter: enforces minimum delay between requests to the same API.
  * Prevents hammering APIs even when multiple tools fire in parallel.
+ *
+ * Concurrent callers reserve spaced departure slots synchronously (before any
+ * await), so a burst of N requests serializes into N spaced departures instead
+ * of all reading the same timestamp, sleeping identically, and firing at once.
  */
-const lastRequestTime = new Map<string, number>();
+const nextSlot = new Map<string, number>();
 
-const DOMAIN_THROTTLE_MS: Record<string, number> = {
-  "api.semanticscholar.org": 1000,
-  "export.arxiv.org": 3000,
-  "eutils.ncbi.nlm.nih.gov": 334,
+// Authenticated vs unauthenticated intervals. Unauthenticated Semantic Scholar
+// shares one global anonymous pool with aggressive limits — space requests the
+// way the bench does (3.5s) to survive it. With a key: 1 req/s.
+const DOMAIN_THROTTLE_MS: Record<string, { auth: number; unauth: number }> = {
+  "api.semanticscholar.org": { auth: 1000, unauth: 3500 },
+  "export.arxiv.org": { auth: 3000, unauth: 3000 },
+  "eutils.ncbi.nlm.nih.gov": { auth: 334, unauth: 334 },
 };
 
 function getDomain(url: string): string {
@@ -18,17 +25,29 @@ function getDomain(url: string): string {
   }
 }
 
-async function throttle(url: string): Promise<void> {
-  const domain = getDomain(url);
-  const minInterval = DOMAIN_THROTTLE_MS[domain];
-  if (!minInterval) return;
+/** Does the outgoing request carry an API key (x-api-key header)? */
+function hasApiKey(options: RequestInit): boolean {
+  const h = options.headers;
+  if (!h) return false;
+  if (h instanceof Headers) return h.has("x-api-key");
+  if (Array.isArray(h)) return h.some(([k]) => k.toLowerCase() === "x-api-key");
+  return Object.keys(h).some((k) => k.toLowerCase() === "x-api-key");
+}
 
-  const last = lastRequestTime.get(domain) ?? 0;
-  const elapsed = Date.now() - last;
-  if (elapsed < minInterval) {
-    await new Promise((r) => setTimeout(r, minInterval - elapsed));
+async function throttle(url: string, authed: boolean): Promise<void> {
+  const domain = getDomain(url);
+  const intervals = DOMAIN_THROTTLE_MS[domain];
+  if (!intervals) return;
+  const minInterval = authed ? intervals.auth : intervals.unauth;
+
+  // Reserve the slot before sleeping — the synchronous read-modify-write is
+  // what keeps concurrent callers from firing simultaneously.
+  const now = Date.now();
+  const slot = Math.max(now, nextSlot.get(domain) ?? 0);
+  nextSlot.set(domain, slot + minInterval);
+  if (slot > now) {
+    await new Promise((r) => setTimeout(r, slot - now));
   }
-  lastRequestTime.set(domain, Date.now());
 }
 
 /**
@@ -42,13 +61,17 @@ async function throttle(url: string): Promise<void> {
  * must never stall a tool call indefinitely:
  * - Every attempt carries a 10s AbortSignal timeout
  * - Backoff delays are capped (Retry-After is honored but never uncapped)
- * - The whole call has a total time budget; when exceeded, the last
- *   error response is returned instead of sleeping on
+ * - The whole call has a total time budget (throttle-queue wait included);
+ *   when exceeded, the last error response is returned instead of sleeping on
  *
  * Follows Semantic Scholar's rate-limit guidance:
  * - Exponential backoff + jitter is mandatory for 429s
  * - 5xx errors (scaling issues) should also use backoff
  * - Minimum 1s floor between any retries
+ *
+ * Retry defaults are domain-aware: unauthenticated Semantic Scholar retries
+ * more patiently (5 attempts, 2s base delay) than everything else (3 / 1s).
+ * Centralized here so every S2 call site gets the same profile.
  */
 const ATTEMPT_TIMEOUT_MS = 10_000;
 const TOTAL_BUDGET_MS = 25_000;
@@ -62,22 +85,7 @@ const TOTAL_BUDGET_MS = 25_000;
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
 const cooldownUntil = new Map<string, number>();
 
-function logFetch(domain: string, status: number | string, ms: number, attempt: number): void {
-  console.log(
-    JSON.stringify({ evt: "upstream_fetch", domain, status, ms, attempt })
-  );
-}
-
-export async function fetchWithRetry(
-  url: string,
-  options: RequestInit = {},
-  maxRetries = 3,
-  baseDelay = 1000,
-  maxDelay = 8_000
-): Promise<Response> {
-  const start = Date.now();
-  const domain = getDomain(url);
-
+function assertNotCooling(domain: string): void {
   const coolingUntil = cooldownUntil.get(domain) ?? 0;
   if (Date.now() < coolingUntil) {
     const secs = Math.ceil((coolingUntil - Date.now()) / 1000);
@@ -87,9 +95,38 @@ export async function fetchWithRetry(
       `${domain} skipped: in cooldown after 429 rate limit (${secs}s remaining)`
     );
   }
+}
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    await throttle(url);
+function logFetch(domain: string, status: number | string, ms: number, attempt: number): void {
+  console.log(
+    JSON.stringify({ evt: "upstream_fetch", domain, status, ms, attempt })
+  );
+}
+
+export async function fetchWithRetry(
+  url: string,
+  options: RequestInit = {},
+  maxRetries?: number,
+  baseDelay?: number,
+  maxDelay = 8_000
+): Promise<Response> {
+  const start = Date.now();
+  const domain = getDomain(url);
+  const authed = hasApiKey(options);
+
+  // Unauthenticated S2 has aggressive rate limits (~100 req/5 min);
+  // retry more patiently with higher base delay when no API key is present
+  const patient = domain === "api.semanticscholar.org" && !authed;
+  const retries = maxRetries ?? (patient ? 5 : 3);
+  const firstDelay = baseDelay ?? (patient ? 2000 : 1000);
+
+  assertNotCooling(domain);
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    await throttle(url, authed);
+    // A sibling request may have hit a 429 while we waited in the queue —
+    // don't pile onto a domain that is already cooling down.
+    assertNotCooling(domain);
     const attemptStart = Date.now();
     let resp: Response | null = null;
     try {
@@ -101,12 +138,12 @@ export async function fetchWithRetry(
     } catch (err) {
       logFetch(domain, "timeout/error", Date.now() - attemptStart, attempt);
       // Timeout or network error — retry if attempts remain, else rethrow
-      if (attempt >= maxRetries - 1) throw err;
+      if (attempt >= retries - 1) throw err;
     }
 
     const retryable =
       (resp === null || resp.status === 429 || resp.status >= 500) &&
-      attempt < maxRetries - 1;
+      attempt < retries - 1;
 
     if (!retryable) {
       if (resp) {
@@ -121,7 +158,7 @@ export async function fetchWithRetry(
     const retryAfter = resp?.headers.get("Retry-After");
     const computed = retryAfter
       ? parseInt(retryAfter, 10) * 1000
-      : baseDelay * Math.pow(2, attempt);
+      : firstDelay * Math.pow(2, attempt);
     const capped = Math.min(computed, maxDelay);
     // Multiplicative jitter (0.5–1.5×) to spread out competing clients
     const jitter = 0.5 + Math.random();
@@ -138,5 +175,5 @@ export async function fetchWithRetry(
     }
     await new Promise((r) => setTimeout(r, delay));
   }
-  throw new Error(`Request failed after ${maxRetries} retries: ${url}`);
+  throw new Error(`Request failed after ${retries} retries: ${url}`);
 }
