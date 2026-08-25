@@ -97,6 +97,54 @@ function assertNotCooling(domain: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Response cache (in-memory, isolate lifetime)
+// ---------------------------------------------------------------------------
+// Paper metadata is effectively immutable and search results tolerate an hour
+// of staleness — re-fetching them spends rate-limit budget for nothing.
+// Agents retry and re-pivot on the same papers constantly; benchmark replays
+// hit identical URLs across runs. Keyed on method+URL+body so the S2 batch
+// and recommendations POSTs cache too. A hit is served BEFORE the cooldown
+// check, deliberately: cached data keeps flowing while a domain is
+// rate-limited. Entry+size capped; insertion-order (oldest-first) eviction.
+
+const HOUR_MS = 3_600_000;
+const CACHE_MAX_ENTRIES = 200;
+const CACHE_MAX_BODY_BYTES = 256 * 1024;
+const responseCache = new Map<string, { expires: number; status: number; body: string }>();
+
+/** TTL by URL class: id lookups are stable, graphs drift slowly, searches shift. */
+function cacheTtl(url: string): number {
+  const LONG = 24 * HOUR_MS;   // immutable-ish: paper metadata by id, venue records
+  const MEDIUM = 6 * HOUR_MS;  // slow drift: citation graphs, recommendations
+  const SHORT = HOUR_MS;       // searches
+
+  if (/semanticscholar\.org\/graph\/v1\/paper\/batch/.test(url)) return LONG;
+  if (/semanticscholar\.org\/graph\/v1\/paper\/[^/?]+\/(citations|references)\?/.test(url)) return MEDIUM;
+  // (?!search) — /paper/search must not classify as a paper-id detail lookup
+  if (/semanticscholar\.org\/graph\/v1\/paper\/(?!search[/?])[^/?]+\?/.test(url)) return LONG;
+  if (/semanticscholar\.org\/recommendations\//.test(url)) return MEDIUM;
+  if (/openalex\.org\/works\/[^?]+/.test(url)) return LONG;
+  if (/openalex\.org\/(sources|topics)\?/.test(url)) return LONG;
+  if (/[?&]filter=(doi|ids\.openalex)(:|%3A)/.test(url)) return LONG;
+  if (/[?&]filter=cites(:|%3A)/.test(url)) return MEDIUM;
+  if (/api\.crossref\.org\/works\//.test(url)) return LONG;
+  return SHORT;
+}
+
+function cachePut(key: string, url: string, status: number, body: string): void {
+  if (body.length > CACHE_MAX_BODY_BYTES) return;
+  if (responseCache.size >= CACHE_MAX_ENTRIES) {
+    let evict = Math.ceil(CACHE_MAX_ENTRIES / 10);
+    for (const k of responseCache.keys()) {
+      responseCache.delete(k);
+      if (--evict <= 0) break;
+    }
+  }
+  responseCache.delete(key); // refresh insertion order on overwrite
+  responseCache.set(key, { expires: Date.now() + cacheTtl(url), status, body });
+}
+
 function logFetch(domain: string, status: number | string, ms: number, attempt: number): void {
   console.log(
     JSON.stringify({ evt: "upstream_fetch", domain, status, ms, attempt })
@@ -119,6 +167,14 @@ export async function fetchWithRetry(
   const patient = domain === "api.semanticscholar.org" && !authed;
   const retries = maxRetries ?? (patient ? 5 : 3);
   const firstDelay = baseDelay ?? (patient ? 2000 : 1000);
+
+  const method = (options.method ?? "GET").toUpperCase();
+  const cacheKey = `${method} ${url} ${typeof options.body === "string" ? options.body : ""}`;
+  const hit = responseCache.get(cacheKey);
+  if (hit && Date.now() < hit.expires) {
+    logFetch(domain, "cache", 0, 0);
+    return new Response(hit.body, { status: hit.status });
+  }
 
   assertNotCooling(domain);
 
@@ -149,6 +205,13 @@ export async function fetchWithRetry(
       if (resp) {
         if (resp.status === 429) {
           cooldownUntil.set(domain, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+          return resp;
+        }
+        if (resp.ok) {
+          // Read once, cache, and hand the caller a reconstructed response
+          const body = await resp.text();
+          cachePut(cacheKey, url, resp.status, body);
+          return new Response(body, { status: resp.status, headers: resp.headers });
         }
         return resp;
       }
