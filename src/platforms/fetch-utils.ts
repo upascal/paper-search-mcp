@@ -53,6 +53,21 @@ async function throttle(url: string): Promise<void> {
 const ATTEMPT_TIMEOUT_MS = 10_000;
 const TOTAL_BUDGET_MS = 25_000;
 
+/**
+ * Rate-limit cooldown: after a request exhausts its retries on 429, skip the
+ * domain entirely for a window. One hot-limited platform (e.g. unauthenticated
+ * Semantic Scholar) must not add its full retry latency to every search.
+ * Isolate-level state, same lifetime as the throttle map.
+ */
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const cooldownUntil = new Map<string, number>();
+
+function logFetch(domain: string, status: number | string, ms: number, attempt: number): void {
+  console.log(
+    JSON.stringify({ evt: "upstream_fetch", domain, status, ms, attempt })
+  );
+}
+
 export async function fetchWithRetry(
   url: string,
   options: RequestInit = {},
@@ -61,15 +76,30 @@ export async function fetchWithRetry(
   maxDelay = 8_000
 ): Promise<Response> {
   const start = Date.now();
+  const domain = getDomain(url);
+
+  const coolingUntil = cooldownUntil.get(domain) ?? 0;
+  if (Date.now() < coolingUntil) {
+    const secs = Math.ceil((coolingUntil - Date.now()) / 1000);
+    // Message deliberately contains "429" — callers treat that as the
+    // rate-limited marker (warnings, test skip conditions).
+    throw new Error(
+      `${domain} skipped: in cooldown after 429 rate limit (${secs}s remaining)`
+    );
+  }
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     await throttle(url);
+    const attemptStart = Date.now();
     let resp: Response | null = null;
     try {
       resp = await fetch(url, {
         ...options,
         signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
       });
+      logFetch(domain, resp.status, Date.now() - attemptStart, attempt);
     } catch (err) {
+      logFetch(domain, "timeout/error", Date.now() - attemptStart, attempt);
       // Timeout or network error — retry if attempts remain, else rethrow
       if (attempt >= maxRetries - 1) throw err;
     }
@@ -79,7 +109,12 @@ export async function fetchWithRetry(
       attempt < maxRetries - 1;
 
     if (!retryable) {
-      if (resp) return resp;
+      if (resp) {
+        if (resp.status === 429) {
+          cooldownUntil.set(domain, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+        }
+        return resp;
+      }
       break;
     }
 
@@ -93,7 +128,12 @@ export async function fetchWithRetry(
     const delay = Math.max(1000, capped * jitter);
     if (Date.now() - start + delay > TOTAL_BUDGET_MS) {
       // Out of budget: return the error response rather than sleeping on
-      if (resp) return resp;
+      if (resp) {
+        if (resp.status === 429) {
+          cooldownUntil.set(domain, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+        }
+        return resp;
+      }
       throw new Error(`Request timed out after ${attempt + 1} attempts: ${url}`);
     }
     await new Promise((r) => setTimeout(r, delay));
