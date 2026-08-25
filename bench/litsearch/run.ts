@@ -349,6 +349,14 @@ async function main() {
           (k) => platformCounts[k] > 0
         ),
         platform_counts: platformCounts,
+        // Full candidate pool with ranking signals for offline re-ranking
+        candidates: papers.map((p) => ({
+          cid: (() => { const c = mapper.paperToCorpusId(p); return c == null ? null : String(c); })(),
+          rrf: (p.extra?.rrf_score as number) ?? 0,
+          q: (p.extra?.quality_score as number | undefined) ?? null,
+          c: p.citations ?? 0,
+          d: p.published_date ?? "",
+        })),
       };
 
       appendFileSync(outFile, JSON.stringify(result) + "\n");

@@ -25,7 +25,7 @@ import { registerTools } from "./tools.js";
 
 export class PaperSearchMCP extends McpAgent<Env> {
   server = new McpServer(
-    { name: "paper-search", version: "0.3.3" },
+    { name: "paper-search", version: "0.4.0" },
     {
       capabilities: { logging: {} },
       instructions: `Paper Search MCP — multi-platform academic paper discovery.
@@ -63,7 +63,7 @@ export default {
 
     if (url.pathname === "/") {
       return new Response(
-        JSON.stringify({ name: "paper-search", version: "0.3.3", status: "ok" }),
+        JSON.stringify({ name: "paper-search", version: "0.4.0", status: "ok" }),
         { headers: { "content-type": "application/json" } }
       );
     }

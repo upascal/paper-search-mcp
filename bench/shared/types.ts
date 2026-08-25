@@ -23,6 +23,21 @@ export interface BenchmarkResult {
   platforms_responded: string[];
   /** Optional: per-platform result counts */
   platform_counts?: Record<string, number>;
+  /** Optional: full fused candidate pool with ranking signals, for offline re-ranking */
+  candidates?: BenchCandidate[];
+}
+
+export interface BenchCandidate {
+  /** Mapped ground-truth corpus id, or null if unmapped */
+  cid: string | null;
+  /** RRF fusion score */
+  rrf: number;
+  /** Quality score 0-100 (null when quality enrichment was off) */
+  q: number | null;
+  /** Citation count */
+  c: number;
+  /** Publication date (ISO, possibly empty) */
+  d: string;
 }
 
 /** Aggregate metrics from an evaluation run. */
