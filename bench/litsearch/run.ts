@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import { benchEnv } from "../shared/env.js";
 import { getEnabledPlatforms } from "../../src/registry.js";
 import { reciprocalRankFusion } from "../../src/rrf.js";
+import { resolveWeights, applyBlendedRanking } from "../../src/scoring.js";
+import type { RankingPreset } from "../../src/scoring.js";
 import { IdMapper } from "./id-mapper.js";
 import type { LitSearchQuery } from "./download.js";
 import type { BenchmarkResult } from "../shared/types.js";
@@ -123,6 +125,8 @@ function parseArgs() {
     delay: 500,
     perPlatform: 15,
     maxResults: 50,
+    // "none" = raw RRF ordering (pre-dials baseline); otherwise a scoring.ts preset
+    preset: "none" as RankingPreset | "none",
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -145,6 +149,9 @@ function parseArgs() {
       case "--max-results":
         opts.maxResults = parseInt(args[++i], 10);
         break;
+      case "--preset":
+        opts.preset = args[++i] as RankingPreset | "none";
+        break;
     }
   }
 
@@ -160,7 +167,7 @@ async function searchQuery(
   platforms: PlatformSource[],
   env: Env,
   limiters: Map<string, RateLimiter>,
-  opts: { perPlatform: number; semantic: boolean }
+  opts: { perPlatform: number; semantic: boolean; preset: RankingPreset | "none" }
 ): Promise<{ papers: Paper[]; platformCounts: Record<string, number> }> {
   // Split platforms into fast (can run in parallel) and slow (need serialized rate limiting).
   // S2 without API key is slow — its retry loop can last 30s+ and shouldn't overlap
@@ -228,7 +235,16 @@ async function searchQuery(
   }
 
   const fused = reciprocalRankFusion(rankedLists);
-  return { papers: fused, platformCounts };
+  // Apply the production blended-ranking pipeline unless measuring raw RRF
+  const papers =
+    opts.preset === "none"
+      ? fused
+      : await applyBlendedRanking(
+          fused,
+          resolveWeights(opts.preset).weights,
+          env
+        );
+  return { papers, platformCounts };
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +305,8 @@ async function main() {
   mkdirSync(RESULTS_DIR, { recursive: true });
   const timestamp = new Date().toISOString().slice(0, 10);
   const platformTag = opts.platforms ?? "default";
-  const outFile = resolve(RESULTS_DIR, `run-${timestamp}-${platformTag}.jsonl`);
+  const presetTag = opts.preset === "none" ? "" : `-${opts.preset}`;
+  const outFile = resolve(RESULTS_DIR, `run-${timestamp}-${platformTag}${presetTag}.jsonl`);
 
   // Resume support: load already-completed query IDs
   const completed = new Set<string>();
@@ -317,7 +334,7 @@ async function main() {
         platforms,
         benchEnv,
         limiters,
-        { perPlatform: opts.perPlatform, semantic: opts.semantic }
+        { perPlatform: opts.perPlatform, semantic: opts.semantic, preset: opts.preset }
       );
 
       const mappedIds = mapper.mapResults(papers);

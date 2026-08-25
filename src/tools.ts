@@ -13,6 +13,8 @@ import { resolveSourceId, batchGetVenueQuality } from "./platforms/openalex.js";
 import { getRecommendations, getCitations } from "./platforms/semantic-scholar.js";
 import { reciprocalRankFusion } from "./rrf.js";
 import { enrichWithQualityScore } from "./discovery-signals.js";
+import { resolveWeights, applyBlendedRanking } from "./scoring.js";
+import type { RankingPreset } from "./scoring.js";
 import type { PlatformSource, Paper, SearchResult } from "./platforms/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
@@ -37,6 +39,62 @@ async function sendStatus(extra: Extra, message: string): Promise<void> {
   } catch {
     // Client may not support logging — fail silently
   }
+}
+
+/** Shared ranking-dial schema fields (PLAN.md: 4 dials + presets). */
+function rankingSchema(defaultPreset: RankingPreset) {
+  return {
+    ranking_preset: z
+      .enum(["relevance", "balanced", "discovery", "impact"])
+      .default(defaultPreset)
+      .optional()
+      .describe(
+        "Ranking blend: 'relevance' (mostly query match + slight quality), " +
+          "'balanced' (all signals), 'discovery' (fresh noteworthy work), " +
+          "'impact' (established, highly-cited). Fine-tune with *_weight params."
+      ),
+    relevance_weight: z
+      .number()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe("Query-match (RRF) weight 0-10; overrides the preset's value"),
+    quality_weight: z
+      .number()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe("Quality-signals weight (venue, FWCI, metadata) 0-10; overrides the preset's value"),
+    recency_weight: z
+      .number()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe("Publication-recency weight (~2yr window) 0-10; overrides the preset's value"),
+    citation_weight: z
+      .number()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe("Citation-count weight (log-scaled) 0-10; overrides the preset's value"),
+  };
+}
+
+interface RankingParams {
+  ranking_preset?: RankingPreset;
+  relevance_weight?: number;
+  quality_weight?: number;
+  recency_weight?: number;
+  citation_weight?: number;
+}
+
+function resolveRankingFromParams(params: RankingParams, defaultPreset: RankingPreset) {
+  return resolveWeights(params.ranking_preset ?? defaultPreset, {
+    relevance: params.relevance_weight,
+    quality: params.quality_weight,
+    recency: params.recency_weight,
+    citations: params.citation_weight,
+  });
 }
 
 interface SearchOptions {
@@ -290,11 +348,7 @@ export function registerTools(server: McpServer, env: Env): void {
         .string()
         .optional()
         .describe("Scope to a specific journal. Accepts journal name or ISSN (e.g. 'Critical AI', '2053-9517')"),
-      sort_by: z
-        .enum(["relevance", "date", "citations"])
-        .default("relevance")
-        .optional()
-        .describe("Sort by: 'relevance' (RRF score — default), 'date' (newest first), 'citations' (most cited)"),
+      ...rankingSchema("relevance"),
       min_citations: z
         .number()
         .min(0)
@@ -363,19 +417,17 @@ export function registerTools(server: McpServer, env: Env): void {
         }
       }
 
-      // Sort
-      if (params.sort_by === "date") {
-        fused.sort((a, b) => new Date(b.published_date).getTime() - new Date(a.published_date).getTime());
-      } else if (params.sort_by === "citations") {
-        fused.sort((a, b) => b.citations - a.citations);
-      }
-      // default "relevance": keep RRF ordering
+      // Blended ranking — relevance × quality × recency × citations dials
+      const { weights, preset } = resolveRankingFromParams(params, "relevance");
+      await sendStatus(extra, "Ranking results...");
+      fused = await applyBlendedRanking(fused, weights, env);
 
       const finalPapers = fused.slice(0, params.max_results);
 
       const output: Record<string, unknown> = {
         queries,
         fusion: "reciprocal_rank_fusion",
+        ranking: { preset, weights },
         query_results: queryResults,
         total_before_fusion: allRankedLists.reduce((sum, l) => sum + l.length, 0),
         total_after_fusion: fused.length,
@@ -428,6 +480,7 @@ export function registerTools(server: McpServer, env: Env): void {
         .max(50)
         .default(20)
         .describe("Max results to return"),
+      ...rankingSchema("discovery"),
     },
     async (params, extra) => {
       const queries = Array.isArray(params.query) ? params.query : [params.query];
@@ -483,22 +536,18 @@ export function registerTools(server: McpServer, env: Env): void {
         return d >= from && d <= to;
       });
 
-      await sendStatus(extra, "Ranking by quality signals...");
-      // Age-adaptive quality scoring — always applied, this IS the purpose
-      const sourceIds = fused
-        .map((p) => p.extra?.openalex_source_id as string)
-        .filter(Boolean);
-      const venueData = sourceIds.length > 0
-        ? await batchGetVenueQuality(sourceIds, env)
-        : undefined;
-      fused = enrichWithQualityScore(fused, venueData);
+      await sendStatus(extra, "Ranking results...");
+      // Blended ranking — defaults to the "discovery" preset (recency-heavy),
+      // with quality enrichment applied inside when quality weight > 0
+      const { weights, preset } = resolveRankingFromParams(params, "discovery");
+      fused = await applyBlendedRanking(fused, weights, env);
 
       const finalPapers = fused.slice(0, params.max_results);
 
       const output: Record<string, unknown> = {
         queries,
         date_range: { from: dateFrom, to: dateTo },
-        scoring: "age_adaptive_quality",
+        ranking: { preset, weights },
         query_results: queryResults,
         total_candidates: fused.length,
         returned: finalPapers.length,
