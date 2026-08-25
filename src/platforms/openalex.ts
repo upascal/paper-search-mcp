@@ -26,6 +26,15 @@ function applyAuth(sp: URLSearchParams, env: Env): void {
 }
 
 /**
+ * OpenAlex treats * and ? as wildcards and rejects them in the default
+ * stemmed search with a 400 ("Wildcards require exact search") — so a
+ * natural-language question mark kills the whole request. Strip them.
+ */
+function sanitizeQuery(query: string): string {
+  return query.replace(/[*?]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
  * OpenAlex stores abstracts as inverted indexes: { "word": [pos1, pos2], ... }
  * This reconstructs the plain-text abstract.
  */
@@ -103,7 +112,7 @@ export async function resolveSourceId(
   name: string,
   env: Env
 ): Promise<{ id: string; issn_l: string | null } | null> {
-  const sp = new URLSearchParams({ search: name, per_page: "1" });
+  const sp = new URLSearchParams({ search: sanitizeQuery(name), per_page: "1" });
   applyAuth(sp, env);
 
   const url = `${BASE_URL}/sources?${sp}`;
@@ -122,7 +131,7 @@ export async function resolveTopicId(
   name: string,
   env: Env
 ): Promise<string | null> {
-  const sp = new URLSearchParams({ search: name, per_page: "1" });
+  const sp = new URLSearchParams({ search: sanitizeQuery(name), per_page: "1" });
   applyAuth(sp, env);
 
   const url = `${BASE_URL}/topics?${sp}`;
@@ -198,10 +207,10 @@ export const openalex: PlatformSource = {
       // OpenAlex semantic search uses GTE-Large embeddings over 217M works.
       // Requires API key. $0.001/query. Finds conceptually related works
       // even when they use different terminology.
-      if (params.query) sp.set("search.semantic", params.query);
+      if (params.query) sp.set("search.semantic", sanitizeQuery(params.query));
     } else {
       // Fall back to keyword search (also used when no API key is set)
-      if (params.query) sp.set("search", params.query);
+      if (params.query) sp.set("search", sanitizeQuery(params.query));
     }
 
     // Build filter parts
