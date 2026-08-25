@@ -38,6 +38,28 @@ function normalizeDoi(id: string): string {
   return id.replace(/^https?:\/\/doi\.org\//i, "").toLowerCase();
 }
 
+/**
+ * Map a paper identifier to an OpenAlex /works lookup key, or null when
+ * OpenAlex cannot resolve that ID space. Accepts W-ids (bare or URL), DOIs
+ * (bare, DOI:-prefixed, or doi.org URL), and PMID:-prefixed PubMed ids.
+ *
+ * Deliberately NOT mapped: arXiv ids via their DataCite DOIs
+ * (10.48550/arXiv.*) — OpenAlex's index of those is unreliable (missing for
+ * 1706.03762, hijacked by a junk record for 2201.11903, fragmented duplicate
+ * for 2005.14165, verified 2026-08). Wrong-paper results are worse than none.
+ * Raw S2 hashes and CorpusIds are likewise unresolvable here.
+ */
+export function toWorksKey(id: string): string | null {
+  const bare = id.trim();
+  const w = bare.match(/^(?:https?:\/\/openalex\.org\/)?(W\d+)$/i);
+  if (w) return w[1].toUpperCase();
+  const doi = bare.replace(/^DOI:/i, "").replace(/^https?:\/\/doi\.org\//i, "");
+  if (/^10\.\d{4,}\//.test(doi)) return `doi:${doi}`;
+  const pmid = bare.match(/^PMID:(\d+)$/i);
+  if (pmid) return `pmid:${pmid[1]}`;
+  return null;
+}
+
 /** Extract the short work ID (W12345) from a bare or URL-form OpenAlex ID. */
 function shortWorkId(id: string): string {
   const m = id.match(/W\d+$/i);
@@ -364,3 +386,116 @@ export const openalex: PlatformSource = {
     return out;
   },
 };
+
+/** Resolve any works key to a bare W-id (needed by the cites: filter). */
+async function resolveWorkId(key: string, env: Env): Promise<string | null> {
+  if (/^W\d+$/.test(key)) return key;
+  const sp = new URLSearchParams({ select: "id" });
+  applyAuth(sp, env);
+  const resp = await fetchWithRetry(`${BASE_URL}/works/${encodeURIComponent(key)}?${sp}`, {
+    headers: buildHeaders(env),
+  });
+  if (!resp.ok) return null;
+  const json = (await resp.json()) as any;
+  const m = (json.id ?? "").match(/W\d+$/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Citation graph via OpenAlex — the fallback when Semantic Scholar is
+ * rate-limited, and the only path for OpenAlex-native W-ids.
+ *
+ * citations:  /works?filter=cites:W...        one call, hydrated results
+ * references: referenced_works on the record, hydrated in ≤50-id batches
+ *
+ * Returns [] when the ID is outside OpenAlex's resolvable space (see
+ * toWorksKey) so callers can distinguish "can't answer" from an error.
+ */
+export async function getOpenAlexCitations(
+  paperId: string,
+  direction: "citations" | "references",
+  env: Env,
+  options?: { limit?: number }
+): Promise<Paper[]> {
+  const limit = options?.limit ?? 20;
+  const key = toWorksKey(paperId);
+  if (!key) return [];
+
+  if (direction === "citations") {
+    const wid = await resolveWorkId(key, env);
+    if (!wid) return [];
+    const sp = new URLSearchParams({
+      filter: `cites:${wid}`,
+      sort: "cited_by_count:desc",
+      per_page: String(Math.min(limit, 100)),
+    });
+    applyAuth(sp, env);
+    const resp = await fetchWithRetry(`${BASE_URL}/works?${sp}`, { headers: buildHeaders(env) });
+    if (!resp.ok) {
+      throw new Error(`OpenAlex cites API ${resp.status}: ${await resp.text()}`);
+    }
+    const json = (await resp.json()) as any;
+    return (json.results ?? []).map(parsePaper);
+  }
+
+  const sp = new URLSearchParams({ select: "id,referenced_works" });
+  applyAuth(sp, env);
+  const resp = await fetchWithRetry(`${BASE_URL}/works/${encodeURIComponent(key)}?${sp}`, {
+    headers: buildHeaders(env),
+  });
+  if (resp.status === 404) return [];
+  if (!resp.ok) {
+    throw new Error(`OpenAlex works API ${resp.status}: ${await resp.text()}`);
+  }
+  const json = (await resp.json()) as any;
+  const refs: string[] = (json.referenced_works ?? []).slice(0, limit);
+  if (refs.length === 0) return [];
+  const hydrated = await openalex.getByIdBatch!(refs, env);
+  return hydrated.filter((p): p is Paper => p !== null);
+}
+
+/**
+ * Related works via OpenAlex — co-citation/concept based, ~10 fixed per work.
+ * Coarser than S2's embedding recommender and no negative steering; used only
+ * as the degraded fallback when the recommendations API is rate-limited.
+ */
+export async function getOpenAlexRelated(
+  seedIds: string[],
+  env: Env,
+  options?: { limit?: number }
+): Promise<Paper[]> {
+  const limit = options?.limit ?? 20;
+  const relatedIds: string[] = [];
+  const seen = new Set<string>();
+
+  // related_works is fixed per work, so more seeds = more coverage; cap the
+  // extra lookups at 3 seeds to bound latency
+  for (const seed of seedIds.slice(0, 3)) {
+    const key = toWorksKey(seed);
+    if (!key) continue;
+    const sp = new URLSearchParams({ select: "id,related_works" });
+    applyAuth(sp, env);
+    try {
+      const resp = await fetchWithRetry(`${BASE_URL}/works/${encodeURIComponent(key)}?${sp}`, {
+        headers: buildHeaders(env),
+      });
+      if (!resp.ok) continue;
+      const json = (await resp.json()) as any;
+      const selfId = (json.id ?? "").match(/W\d+$/)?.[0];
+      if (selfId) seen.add(selfId);
+      for (const rw of json.related_works ?? []) {
+        const wid = String(rw).match(/W\d+$/)?.[0];
+        if (wid && !seen.has(wid)) {
+          seen.add(wid);
+          relatedIds.push(wid);
+        }
+      }
+    } catch {
+      // Seed unresolvable — skip it, other seeds may still produce results
+    }
+  }
+
+  if (relatedIds.length === 0) return [];
+  const hydrated = await openalex.getByIdBatch!(relatedIds.slice(0, limit), env);
+  return hydrated.filter((p): p is Paper => p !== null);
+}

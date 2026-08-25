@@ -9,7 +9,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getEnabledPlatforms, getOptionalPlatformNames } from "./registry.js";
-import { resolveSourceId, batchGetVenueQuality } from "./platforms/openalex.js";
+import { resolveSourceId, batchGetVenueQuality, getOpenAlexCitations, getOpenAlexRelated } from "./platforms/openalex.js";
 import { getRecommendations, getCitations } from "./platforms/semantic-scholar.js";
 import { reciprocalRankFusion } from "./rrf.js";
 import { enrichWithQualityScore } from "./discovery-signals.js";
@@ -678,7 +678,8 @@ export function registerTools(server: McpServer, env: Env): void {
       "Provide 1+ paper IDs you like (positive) and optionally IDs to steer away from (negative). " +
       "Accepts DOIs (DOI:xxx), arXiv IDs (ARXIV:xxx), PMIDs (PMID:xxx), or S2 IDs. " +
       "Best used after search_papers finds a highly relevant seed paper. " +
-      "Can chain: search → find_similar → get_citation_graph for comprehensive coverage.",
+      "Can chain: search → find_similar → get_citation_graph for comprehensive coverage. " +
+      "When Semantic Scholar is rate-limited, falls back to OpenAlex related works (coarser, DOI seeds only).",
     {
       positive_paper_ids: z
         .array(z.string())
@@ -701,12 +702,31 @@ export function registerTools(server: McpServer, env: Env): void {
     async (params, extra) => {
       try {
         await sendStatus(extra, `Finding papers similar to ${params.positive_paper_ids.length} seed papers...`);
-        const papers = await getRecommendations(
-          params.positive_paper_ids,
-          params.negative_paper_ids ?? [],
-          env,
-          { limit: params.max_results }
-        );
+        let papers: Paper[];
+        let source = "semantic_scholar_recommendations";
+        const warnings: string[] = [];
+        try {
+          papers = await getRecommendations(
+            params.positive_paper_ids,
+            params.negative_paper_ids ?? [],
+            env,
+            { limit: params.max_results }
+          );
+        } catch (err: any) {
+          // Only rate limiting falls through to the degraded path; real
+          // errors (bad ids, bad fields) should surface as errors
+          if (!err.message?.includes("429")) throw err;
+          await sendStatus(extra, "Semantic Scholar rate-limited — falling back to OpenAlex related works...");
+          papers = await getOpenAlexRelated(params.positive_paper_ids, env, {
+            limit: params.max_results,
+          });
+          source = "openalex_related_works";
+          warnings.push(
+            "Semantic Scholar recommendations are rate-limited; served OpenAlex related works instead. " +
+              "Coarser similarity (co-citation based), no negative steering, and arXiv-id seeds " +
+              "cannot be resolved — retry with DOI seeds or wait ~60s for the S2 cooldown to clear."
+          );
+        }
         return {
           content: [
             {
@@ -715,8 +735,10 @@ export function registerTools(server: McpServer, env: Env): void {
                 {
                   seed_papers: params.positive_paper_ids,
                   negative_papers: params.negative_paper_ids ?? [],
+                  source,
                   total: papers.length,
                   papers,
+                  ...(warnings.length > 0 ? { warnings } : {}),
                 },
                 null,
                 2
@@ -841,7 +863,8 @@ export function registerTools(server: McpServer, env: Env): void {
       "direction='citations' to find follow-up/derivative work. " +
       "Best used after finding a highly relevant paper via search_papers or find_similar_papers — " +
       "call multiple times to walk multi-hop citation chains. " +
-      "Accepts S2 IDs, DOIs (DOI:xxx), arXiv IDs (ARXIV:xxx), or PMIDs (PMID:xxx).",
+      "Accepts S2 IDs, DOIs (DOI:xxx), arXiv IDs (ARXIV:xxx), PMIDs (PMID:xxx), or OpenAlex W-ids. " +
+      "Falls back to OpenAlex's citation graph when Semantic Scholar is rate-limited (DOI/W-id/PMID only).",
     {
       paper_id: z
         .string()
@@ -869,12 +892,38 @@ export function registerTools(server: McpServer, env: Env): void {
           extra,
           `Getting ${params.direction} for paper ${params.paper_id}...`
         );
-        const papers = await getCitations(
-          params.paper_id,
-          params.direction,
-          env,
-          { limit: params.max_results }
-        );
+        let papers: Paper[] = [];
+        let source = "semantic_scholar";
+        const warnings: string[] = [];
+        try {
+          papers = await getCitations(
+            params.paper_id,
+            params.direction,
+            env,
+            { limit: params.max_results }
+          );
+        } catch (err: any) {
+          if (!err.message?.includes("429")) throw err;
+          await sendStatus(extra, "Semantic Scholar rate-limited — falling back to OpenAlex...");
+          warnings.push(
+            "Semantic Scholar is rate-limited; served from OpenAlex's citation graph instead. " +
+              "arXiv ids cannot be resolved on this path — use a DOI if results are empty."
+          );
+        }
+        if (papers.length === 0) {
+          // Rate-limited, unknown to S2 (e.g. OpenAlex W-ids), or genuinely
+          // uncited — OpenAlex can answer all three
+          const oaPapers = await getOpenAlexCitations(
+            params.paper_id,
+            params.direction,
+            env,
+            { limit: params.max_results }
+          );
+          if (oaPapers.length > 0) {
+            papers = oaPapers;
+            source = "openalex";
+          }
+        }
         return {
           content: [
             {
@@ -883,8 +932,10 @@ export function registerTools(server: McpServer, env: Env): void {
                 {
                   paper_id: params.paper_id,
                   direction: params.direction,
+                  source,
                   total: papers.length,
                   papers,
+                  ...(warnings.length > 0 ? { warnings } : {}),
                 },
                 null,
                 2
