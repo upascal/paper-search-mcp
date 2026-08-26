@@ -12,7 +12,7 @@ const nextSlot = new Map<string, number>();
 // shares one global anonymous pool with aggressive limits — space requests the
 // way the bench does (3.5s) to survive it. With a key: 1 req/s.
 const DOMAIN_THROTTLE_MS: Record<string, { auth: number; unauth: number }> = {
-  "api.semanticscholar.org": { auth: 1000, unauth: 3500 },
+  "api.semanticscholar.org": { auth: 1100, unauth: 3500 },
   "export.arxiv.org": { auth: 3000, unauth: 3000 },
   "eutils.ncbi.nlm.nih.gov": { auth: 334, unauth: 334 },
 };
@@ -83,7 +83,16 @@ const TOTAL_BUDGET_MS = 25_000;
  * Isolate-level state, same lifetime as the throttle map.
  */
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
+// With a dedicated API key, a 429 is a blip (bucket boundary, edge-node
+// propagation), not a hot shared pool — a 60s blackout would amplify one
+// flaky response into ~20 skipped requests. Cool down briefly instead.
+const AUTH_RATE_LIMIT_COOLDOWN_MS = 15_000;
 const cooldownUntil = new Map<string, number>();
+
+function startCooldown(domain: string, authed: boolean): void {
+  const ms = authed ? AUTH_RATE_LIMIT_COOLDOWN_MS : RATE_LIMIT_COOLDOWN_MS;
+  cooldownUntil.set(domain, Date.now() + ms);
+}
 
 function assertNotCooling(domain: string): void {
   const coolingUntil = cooldownUntil.get(domain) ?? 0;
@@ -204,7 +213,7 @@ export async function fetchWithRetry(
     if (!retryable) {
       if (resp) {
         if (resp.status === 429) {
-          cooldownUntil.set(domain, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+          startCooldown(domain, authed);
           return resp;
         }
         if (resp.ok) {
@@ -230,7 +239,7 @@ export async function fetchWithRetry(
       // Out of budget: return the error response rather than sleeping on
       if (resp) {
         if (resp.status === 429) {
-          cooldownUntil.set(domain, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+          startCooldown(domain, authed);
         }
         return resp;
       }

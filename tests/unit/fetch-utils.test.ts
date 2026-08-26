@@ -75,6 +75,27 @@ describe("fetchWithRetry throttling", () => {
     expect(sorted[2] - sorted[0]).toBeLessThan(3500);
   });
 
+  it("authenticated cooldown is short (15s) — a keyed 429 is a blip, not a hot pool", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("rate limited", { status: 429 }))
+    );
+    const fetchWithRetry = await freshFetchWithRetry();
+    const opts = { headers: { "x-api-key": "test-key" } };
+
+    const resp = await fetchWithRetry(S2_URL, opts, 1);
+    expect(resp.status).toBe(429);
+
+    await vi.advanceTimersByTimeAsync(14_000);
+    await expect(fetchWithRetry(S2_URL, opts, 1)).rejects.toThrow(/429/);
+
+    await vi.advanceTimersByTimeAsync(2_000); // past 15s — cooldown cleared
+    const p = fetchWithRetry(S2_URL, opts, 1);
+    await vi.runAllTimersAsync();
+    expect((await p).status).toBe(429); // fetched again rather than failing fast
+    expect(vi.mocked(fetch).mock.calls.length).toBe(2);
+  });
+
   it("enters cooldown after an unretried 429 and fails fast while cooling", async () => {
     vi.stubGlobal(
       "fetch",
