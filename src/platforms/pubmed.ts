@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { fetchWithRetry } from "./fetch-utils.js";
 import type { PlatformSource, Paper, SearchResult, SearchParams } from "./types.js";
 
 const ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
@@ -72,7 +73,7 @@ export const pubmed: PlatformSource = {
 
     // Step 1: search for IDs
     const searchUrl = `${ESEARCH_URL}?db=pubmed&term=${encodeURIComponent(params.query)}&retmax=${maxResults}&retmode=xml${key}`;
-    const searchResp = await fetch(searchUrl);
+    const searchResp = await fetchWithRetry(searchUrl, {}, 3);
     if (!searchResp.ok) {
       throw new Error(`PubMed esearch ${searchResp.status}: ${await searchResp.text()}`);
     }
@@ -89,7 +90,7 @@ export const pubmed: PlatformSource = {
 
     // Step 2: fetch metadata
     const fetchUrl = `${EFETCH_URL}?db=pubmed&id=${ids.join(",")}&retmode=xml${key}`;
-    const fetchResp = await fetch(fetchUrl);
+    const fetchResp = await fetchWithRetry(fetchUrl, {}, 3);
     if (!fetchResp.ok) {
       throw new Error(`PubMed efetch ${fetchResp.status}: ${await fetchResp.text()}`);
     }

@@ -56,9 +56,50 @@ export function reciprocalRankFusion(
   }));
 }
 
-/** Generate a deduplication key for a paper. */
+/** Normalize a DOI: lowercase, strip URL prefixes and "doi:" label. */
+function normalizeDoi(doi: string | undefined | null): string {
+  if (!doi) return "";
+  return doi
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//, "")
+    .replace(/^doi:/, "");
+}
+
+/** Extract a canonical arXiv id (version-stripped, lowercase) from any platform's record. */
+function getArxivId(paper: Paper): string {
+  if (paper.source === "arxiv" && paper.paper_id) {
+    return paper.paper_id.toLowerCase().replace(/v\d+$/, "");
+  }
+  // Semantic Scholar carries externalIds.ArXiv
+  const ext = (paper.extra as Record<string, any> | undefined)?.externalIds?.ArXiv;
+  if (typeof ext === "string" && ext) {
+    return ext.toLowerCase().replace(/v\d+$/, "");
+  }
+  // arXiv's own DOI namespace: 10.48550/arXiv.<id>
+  const m = normalizeDoi(paper.doi).match(/^10\.48550\/arxiv\.(.+)$/);
+  if (m) return m[1].replace(/v\d+$/, "");
+  return "";
+}
+
+/**
+ * Generate a deduplication key for a paper.
+ *
+ * A published DOI is the strongest identity — arXiv records that link their
+ * published version (arxiv:doi) merge with CrossRef/S2 records through it.
+ * arXiv's own DOI namespace (10.48550/…) identifies only the preprint, so
+ * those key by canonical arXiv id instead, merging the arXiv API record with
+ * S2/OpenAlex records of the same preprint.
+ *
+ * Known limitation: a preprint-only record and a published-DOI-only record of
+ * the same paper cannot be merged without an external linkage lookup.
+ */
 function paperKey(paper: Paper): string {
-  if (paper.doi) return `doi:${paper.doi.toLowerCase()}`;
+  const doi = normalizeDoi(paper.doi);
+  if (doi && !doi.startsWith("10.48550/")) return `doi:${doi}`;
+  const arxivId = getArxivId(paper);
+  if (arxivId) return `arxiv:${arxivId}`;
+  if (doi) return `doi:${doi}`;
   return `${paper.source}:${paper.paper_id}`;
 }
 

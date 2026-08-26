@@ -4,13 +4,18 @@ import type { PlatformSource, Paper, SearchResult, SearchParams } from "./types.
 const BASE_URL = "https://api.semanticscholar.org/graph/v1";
 const RECOMMENDATIONS_URL = "https://api.semanticscholar.org/recommendations/v1";
 
-// Include tldr, s2FieldsOfStudy, and author-level metrics for discovery signals
-const FIELDS =
+// Lighter field set for search — reduces payload and rate-limit pressure
+const SEARCH_FIELDS =
+  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,openAccessPdf,publicationVenue";
+
+// Full fields for getById — includes enrichment data
+const DETAIL_FIELDS =
   "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
 
-// Bulk search fields (nested author fields also work in bulk)
-const BULK_FIELDS =
-  "title,abstract,year,citationCount,influentialCitationCount,authors,authors.hIndex,authors.citationCount,authors.paperCount,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,tldr,publicationVenue";
+// The /recommendations endpoint accepts a narrower field set than /graph:
+// tldr and the authors.* aggregate metrics are rejected with a 400.
+const RECOMMENDATION_FIELDS =
+  "title,abstract,year,citationCount,influentialCitationCount,authors,url,publicationDate,externalIds,fieldsOfStudy,s2FieldsOfStudy,openAccessPdf,publicationVenue";
 
 function headers(env: Env): Record<string, string> {
   const h: Record<string, string> = {};
@@ -70,7 +75,7 @@ export const semanticScholar: PlatformSource = {
     const sp = new URLSearchParams({
       query: params.query,
       limit: String(limit),
-      fields: FIELDS,
+      fields: SEARCH_FIELDS,
     });
     if (params.year) sp.set("year", String(params.year));
 
@@ -91,13 +96,38 @@ export const semanticScholar: PlatformSource = {
   },
 
   async getById(paperId: string, env: Env): Promise<Paper | null> {
-    const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}?fields=${FIELDS}`;
+    const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}?fields=${DETAIL_FIELDS}`;
     const resp = await fetchWithRetry(url, { headers: headers(env) });
     if (resp.status === 404) return null;
     if (!resp.ok) {
       throw new Error(`Semantic Scholar API ${resp.status}: ${await resp.text()}`);
     }
     return parsePaper(await resp.json());
+  },
+
+  /**
+   * Batch lookup: POST /paper/batch resolves up to 500 IDs per request —
+   * one call instead of a GET per paper, which is the difference between
+   * working and cascading 429s without an API key.
+   * Unknown or foreign IDs (e.g. OpenAlex W-ids) come back as null, not 400.
+   * Returns an array aligned with the input.
+   */
+  async getByIdBatch(paperIds: string[], env: Env): Promise<(Paper | null)[]> {
+    const out: (Paper | null)[] = [];
+    for (let i = 0; i < paperIds.length; i += 500) {
+      const chunk = paperIds.slice(i, i + 500);
+      const resp = await fetchWithRetry(`${BASE_URL}/paper/batch?fields=${DETAIL_FIELDS}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers(env) },
+        body: JSON.stringify({ ids: chunk }),
+      });
+      if (!resp.ok) {
+        throw new Error(`Semantic Scholar Batch API ${resp.status}: ${await resp.text()}`);
+      }
+      const json = (await resp.json()) as any[];
+      out.push(...json.map((raw) => (raw && raw.paperId ? parsePaper(raw) : null)));
+    }
+    return out;
   },
 };
 
@@ -110,7 +140,7 @@ async function bulkSearch(params: SearchParams, env: Env): Promise<SearchResult>
   const limit = Math.min(params.max_results ?? 10, 1000);
   const sp = new URLSearchParams({
     query: params.query,
-    fields: BULK_FIELDS,
+    fields: SEARCH_FIELDS,
   });
   if (params.year) sp.set("year", String(params.year));
   if (params.sort) {
@@ -147,7 +177,7 @@ export async function getRecommendations(
   options?: { limit?: number; fields?: string }
 ): Promise<Paper[]> {
   const limit = options?.limit ?? 20;
-  const fields = options?.fields ?? FIELDS;
+  const fields = options?.fields ?? RECOMMENDATION_FIELDS;
 
   const sp = new URLSearchParams({
     fields,
@@ -173,4 +203,37 @@ export async function getRecommendations(
 
   const json = (await resp.json()) as any;
   return (json.recommendedPapers ?? []).map(parsePaper);
+}
+
+/**
+ * Citation graph traversal: get papers that cite or are referenced by a given paper.
+ * GET /graph/v1/paper/{id}/citations  — papers that cite this one
+ * GET /graph/v1/paper/{id}/references — papers this one cites
+ */
+export async function getCitations(
+  paperId: string,
+  direction: "citations" | "references",
+  env: Env,
+  options?: { limit?: number }
+): Promise<Paper[]> {
+  const limit = options?.limit ?? 20;
+  const sp = new URLSearchParams({
+    fields: SEARCH_FIELDS,
+    limit: String(limit),
+  });
+
+  const url = `${BASE_URL}/paper/${encodeURIComponent(paperId)}/${direction}?${sp}`;
+  const resp = await fetchWithRetry(url, { headers: headers(env) });
+
+  if (resp.status === 404) return [];
+  if (!resp.ok) {
+    throw new Error(`S2 ${direction} API ${resp.status}: ${await resp.text()}`);
+  }
+
+  const json = (await resp.json()) as any;
+  const key = direction === "citations" ? "citingPaper" : "citedPaper";
+  return (json.data ?? [])
+    .map((entry: any) => entry[key])
+    .filter((p: any) => p && p.paperId)
+    .map(parsePaper);
 }

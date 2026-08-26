@@ -1,7 +1,7 @@
 {
   "name": "Paper Search",
   "description": "Search academic papers across multiple platforms (Semantic Scholar, CrossRef, arXiv, OpenAlex, PubMed, bioRxiv, medRxiv) with RRF fusion, semantic search, and journal monitoring",
-  "version": "0.2.3",
+  "version": "0.4.0",
   "worker": {
     "name": "paper-search-mcp",
     "durableObjectBinding": "MCP_OBJECT",
@@ -16,7 +16,6 @@
       "label": "Semantic Scholar API Key",
       "type": "password",
       "required": false,
-      "forPlatform": "semantic_scholar",
       "helpText": "API key for Semantic Scholar (optional, but recommended for higher rate limits)",
       "helpUrl": "https://www.semanticscholar.org/product/api",
       "placeholder": "Enter API key",
@@ -49,7 +48,6 @@
       "label": "OpenAlex API Key",
       "type": "password",
       "required": false,
-      "forPlatform": "openalex",
       "helpText": "Free API key for OpenAlex. Required since Feb 2026. Enables semantic search ($0.001/query) and higher rate limits.",
       "helpUrl": "https://docs.openalex.org/how-to-use-the-api/api-key",
       "placeholder": "Enter API key",

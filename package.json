@@ -1,6 +1,6 @@
 {
   "name": "paper-search-mcp",
-  "version": "0.2.3",
+  "version": "0.4.0",
   "private": true,
   "description": "Academic paper search MCP server for Cloudflare Workers (mcp-deploy compatible)",
   "scripts": {
@@ -8,17 +8,23 @@
     "build": "wrangler deploy --dry-run --outdir=dist && mv dist/index.js dist/worker.mjs",
     "release": "npm run build && mkdir -p release-assets && cp dist/worker.mjs release-assets/worker.mjs && cp mcp-deploy.json release-assets/mcp-deploy.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:download": "tsx bench/litsearch/download.ts",
+    "bench:run": "tsx bench/litsearch/run.ts",
+    "bench:eval": "tsx bench/litsearch/evaluate.ts",
+    "bench:agentic": "tsx bench/agentic/run.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.25.2",
-    "agents": "^0.3.6",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "agents": "^0.21.0",
     "fast-xml-parser": "^4.5.0",
-    "zod": "^3.24.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
     "@cloudflare/workers-types": "^4.20250109.0",
     "@types/node": "^25.4.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.0.18",
     "wrangler": "^4.0.0"

@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { fetchWithRetry } from "./fetch-utils.js";
 import type { PlatformSource, Paper, SearchResult, SearchParams } from "./types.js";
 
 const API_URL = "http://export.arxiv.org/api/query";
@@ -67,7 +68,7 @@ export const arxiv: PlatformSource = {
     });
 
     const url = `${API_URL}?${sp}`;
-    const resp = await fetch(url);
+    const resp = await fetchWithRetry(url, {}, 3);
     if (!resp.ok) {
       throw new Error(`arXiv API ${resp.status}: ${await resp.text()}`);
     }
